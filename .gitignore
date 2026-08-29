@@ -1,0 +1,26 @@
+# Secrets - regenerated per machine by install.ps1. Never commit these.
+.bridge-token
+extension/token.json
+
+# Runtime artefacts
+artifacts/
+*.log
+*.status
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Editor / OS
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
+*.swp
+*~
+
+# Backups
+*.bak
+*.bak-*

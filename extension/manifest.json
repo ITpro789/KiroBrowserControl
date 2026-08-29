@@ -1,0 +1,47 @@
+{
+  "manifest_version": 3,
+  "name": "Kiro Browser Bridge",
+  "version": "1.0.1",
+  "description": "Native Chrome control for the Kiro agent via the Chrome Debugger Protocol over an authenticated local bridge.",
+  "minimum_chrome_version": "116",
+
+  "permissions": [
+    "debugger",
+    "tabs",
+    "activeTab",
+    "scripting",
+    "storage",
+    "alarms",
+    "webNavigation"
+  ],
+
+  "host_permissions": [
+    "<all_urls>",
+    "http://127.0.0.1/*",
+    "http://localhost/*",
+    "ws://127.0.0.1/*",
+    "ws://localhost/*"
+  ],
+
+  "content_security_policy": {
+    "extension_pages": "script-src 'self'; object-src 'none'; connect-src 'self' ws://127.0.0.1:* ws://localhost:* http://127.0.0.1:* http://localhost:*;"
+  },
+
+  "background": {
+    "service_worker": "background.js"
+  },
+
+  "action": {
+    "default_title": "Kiro Browser Bridge",
+    "default_popup": "popup.html"
+  },
+
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["content.js"],
+      "run_at": "document_start",
+      "all_frames": false
+    }
+  ]
+}

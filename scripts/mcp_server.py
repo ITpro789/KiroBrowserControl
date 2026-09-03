@@ -65,13 +65,31 @@ def summarise(result: dict, include_elements=True) -> str:
     lines = [
         f"url:   {tab.get('url', '?')}",
         f"title: {tab.get('title', '?')}",
+        f"tab:   id={tab.get('id', '?')}"
+        + ("  (Kiro agent tab, running in the background)" if tab.get("agent")
+           else "  (not the agent tab)"),
     ]
 
     if result.get("result") is not None:
         lines.append(f"result: {json.dumps(result['result'])[:2000]}")
 
+    for dlg in result.get("dialogs", []):
+        verb = "accepted" if dlg.get("handled") == "accept" else "cancelled"
+        note = ""
+        if dlg.get("default_used") and dlg.get("type") in ("confirm", "prompt"):
+            note = " - pass on_dialog='accept' to confirm it instead"
+        lines.append(f"dialog: {dlg.get('type')} {verb}{note}"
+                     f"\n        \"{dlg.get('message', '')}\"")
+
     if result.get("screenshot_saved"):
         lines.append(f"screenshot: {result['screenshot_saved']}")
+    if result.get("screenshot_mode") == "focused":
+        lines.append("note: the background screenshot failed so the tab was briefly "
+                     "brought to the front. Reason: "
+                     f"{result.get('background_capture_error', 'unknown')}")
+    if result.get("screenshot_error"):
+        lines.append(f"screenshot unavailable: {result['screenshot_error']} "
+                     f"(element list below is still accurate)")
 
     if include_elements:
         elements = result.get("elements", [])
@@ -204,8 +222,37 @@ TOOLS = [
     },
     {
         "name": "browser_list_tabs",
-        "description": "List all open tabs with their ids, titles and URLs.",
+        "description": (
+            "List all open tabs with their ids, titles and URLs. The tab marked [agent] "
+            "is the one in the Kiro tab group that browser tools drive by default."
+        ),
         "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "browser_use_tab",
+        "description": (
+            "Adopt an existing tab as the agent's working tab, so later calls without "
+            "tab_id act on it. Use when the user asks you to work on a page they already "
+            "have open instead of the Kiro tab."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {"tab_id": {"type": "integer"}},
+            "required": ["tab_id"],
+        },
+    },
+    {
+        "name": "browser_focus_tab",
+        "description": (
+            "Bring the agent's tab to the front and focus its window. The agent normally "
+            "works in an unfocused background tab; call this only when the user needs to "
+            "see or take over the page, for example to sign in or clear a CAPTCHA. It "
+            "interrupts whatever they are doing, so do not call it routinely."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {"tab_id": {"type": "integer"}},
+        },
     },
     {
         "name": "browser_eval",
@@ -225,6 +272,30 @@ TOOLS = [
     },
 ]
 
+# Any action that navigates or mutates the page can raise a dialog, so the same
+# override is offered on all of them rather than repeated in five schemas.
+DIALOG_PROPS = {
+    "on_dialog": {
+        "type": "string",
+        "enum": ["accept", "dismiss"],
+        "description": (
+            "How to answer a JavaScript dialog raised by this action. alert and "
+            "beforeunload are always accepted. confirm and prompt default to dismiss, "
+            "because accepting an unknown confirmation can be destructive - pass "
+            "'accept' only when you know what is being confirmed."
+        ),
+    },
+    "dialog_text": {
+        "type": "string",
+        "description": "Text to submit when the dialog is a prompt() and on_dialog is 'accept'.",
+    },
+}
+
+for _tool in TOOLS:
+    if _tool["name"] in ("browser_navigate", "browser_click", "browser_type",
+                         "browser_fill", "browser_key"):
+        _tool["inputSchema"]["properties"].update(DIALOG_PROPS)
+
 ACTION_FOR = {
     "browser_get_state": "get_state",
     "browser_navigate": "navigate",
@@ -234,6 +305,8 @@ ACTION_FOR = {
     "browser_key": "key",
     "browser_scroll": "scroll",
     "browser_list_tabs": "get_state",
+    "browser_use_tab": "switch_tab",
+    "browser_focus_tab": "focus_tab",
     "browser_eval": "eval",
 }
 
@@ -244,7 +317,8 @@ def dispatch_tool(name: str, args: dict) -> str:
         return f"ERROR: unknown tool {name}"
 
     payload = {"action": action}
-    for key in ("tab_id", "url", "text", "key", "code", "direction", "amount", "x", "y"):
+    for key in ("tab_id", "url", "text", "key", "code", "direction", "amount", "x", "y",
+                "on_dialog", "dialog_text"):
         if key in args and args[key] is not None:
             payload[key] = args[key]
 
@@ -261,7 +335,10 @@ def dispatch_tool(name: str, args: dict) -> str:
         lines = [f"{len(result.get('tabs', []))} open tab(s):"]
         for t in result.get("tabs", []):
             mark = "*" if t.get("active") else " "
-            lines.append(f"  {mark} id={t['id']}  {str(t.get('title'))[:70]}\n      {t.get('url')}")
+            tag = " [agent]" if t.get("agent") else ""
+            lines.append(f"  {mark} id={t['id']}{tag}  {str(t.get('title'))[:70]}"
+                         f"\n      {t.get('url')}")
+        lines.append("\n* = tab the user is looking at, [agent] = the Kiro tab you drive")
         return "\n".join(lines)
 
     return summarise(result, include_elements=(name != "browser_eval"))

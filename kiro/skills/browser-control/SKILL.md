@@ -19,8 +19,58 @@ asking him to click things.
 | `browser_fill` | Set a field by element number or CSS selector (React-safe) |
 | `browser_key` | Press a named key |
 | `browser_scroll` | Scroll up or down |
-| `browser_list_tabs` | List open tabs with ids |
+| `browser_list_tabs` | List open tabs with ids; `[agent]` marks the Kiro tab |
+| `browser_use_tab` | Adopt an existing tab as the working tab |
+| `browser_focus_tab` | Bring the working tab to the front (interrupts him) |
 | `browser_eval` | Run JS - only works if the bridge was started with `--allow-eval` |
+
+## You work in a background tab, not his tab
+
+Every tool acts on one tab the agent owns, held in a tab group labelled
+**Kiro**. It is created on the first command and is never activated, so he can
+keep browsing in his own tab while you work. Do not try to work around this.
+
+- Without `tab_id`, tools act on the Kiro tab. This is what you want.
+- Pass `tab_id` for a one-off action on another tab.
+- `browser_use_tab` adopts a tab permanently, for when he says "use the page I
+  already have open".
+- `browser_focus_tab` steals his focus. Only call it when he genuinely has to
+  look at the page, for example a sign-in or a CAPTCHA. Say why first.
+
+Screenshots of an unfocused tab need a compositor frame that Chrome does not
+normally produce, so the capture is forced via device-metrics override. If it
+still fails you get `screenshot unavailable` plus a full element list. That list
+is accurate; carry on with it rather than retrying the screenshot.
+
+Hidden tabs also throttle timers and pause `requestAnimationFrame`. A page that
+looks half-rendered is usually mid-animation, not broken. Re-read state before
+concluding anything.
+
+## JavaScript dialogs
+
+`alert`, `confirm`, `prompt` and "Leave site?" are answered for you. You never
+have to ask him to click one. Every dialog that fired is listed in the response.
+
+| Dialog | Default |
+| --- | --- |
+| `alert` | accepted — it only has one button |
+| `beforeunload` ("Leave site?") | accepted — you asked to navigate |
+| `confirm` | **cancelled** |
+| `prompt` | **cancelled** |
+
+`confirm` and `prompt` default to cancel because "Delete everything?" and "Save
+changes?" are indistinguishable at that layer. When you know what is being
+confirmed, pass `on_dialog: "accept"` on the action that triggers it, plus
+`dialog_text` for a prompt. The override applies to that one call only.
+
+```
+click 14                             -> dialog: confirm cancelled
+click 14 on_dialog=accept            -> dialog: confirm accepted
+```
+
+If a response says a confirm was cancelled and the action did not take effect,
+that is why. Re-issue it with `on_dialog: "accept"` — do not conclude the click
+failed.
 
 ## How to use it
 
@@ -43,7 +93,7 @@ Other notes:
 - `browser_fill` beats `browser_type` for form fields. It uses the native
   property setter, so React, Angular and Vue register the change. Plain typing
   often leaves framework state stale.
-- Pass `tab_id` to target a specific tab. Without it you get the active one.
+- Pass `tab_id` to target a specific tab. Without it you get the Kiro tab.
 - `chrome://`, `edge://`, and extension pages cannot be automated. Chrome
   blocks debugger attachment to them.
 - A page that has just loaded may report very few elements. Re-read state.

@@ -129,10 +129,17 @@ class Bridge:
 
                 shot = msg.pop("screenshot", "")
                 if shot and "," in shot:
+                    header, _, payload = shot.partition(",")
+                    # Background captures come back as JPEG, so the extension is
+                    # taken from the data URL rather than assumed to be PNG.
+                    suffix = ".jpg" if "image/jpeg" in header else ".png"
                     try:
                         ARTIFACTS.mkdir(parents=True, exist_ok=True)
-                        path = ARTIFACTS / "browser_view.png"
-                        path.write_bytes(base64.b64decode(shot.split(",", 1)[1]))
+                        for stale in ARTIFACTS.glob("browser_view.*"):
+                            if stale.suffix != suffix:
+                                stale.unlink(missing_ok=True)
+                        path = ARTIFACTS / f"browser_view{suffix}"
+                        path.write_bytes(base64.b64decode(payload))
                         msg["screenshot_saved"] = str(path)
                     except Exception as exc:
                         msg["screenshot_error"] = str(exc)
@@ -283,6 +290,8 @@ def run_cli(args):
         "direction": args.direction,
         "amount": args.amount,
         "tab_id": args.tab_id,
+        "on_dialog": args.on_dialog,
+        "dialog_text": args.dialog_text,
     }
     payload = {k: v for k, v in payload.items() if v is not None}
 
@@ -315,7 +324,7 @@ def main():
     parser.add_argument("--print-token", action="store_true", help="print the token and exit")
     parser.add_argument("--action", default="get_state",
                         choices=["get_state", "navigate", "click", "type", "form_input",
-                                 "scroll", "switch_tab", "eval", "key"])
+                                 "scroll", "switch_tab", "focus_tab", "eval", "key"])
     parser.add_argument("--url", default="")
     parser.add_argument("--target", default="")
     parser.add_argument("--x", type=int)
@@ -327,6 +336,10 @@ def main():
     parser.add_argument("--direction", default="down", choices=["up", "down"])
     parser.add_argument("--amount", type=int, default=500)
     parser.add_argument("--tab-id", type=int, dest="tab_id")
+    parser.add_argument("--on-dialog", dest="on_dialog", choices=["accept", "dismiss"],
+                        help="how to answer a JS dialog raised by this action")
+    parser.add_argument("--dialog-text", dest="dialog_text",
+                        help="text to submit to a prompt() when accepting")
     parser.add_argument("--brief", action="store_true", help="omit the element list from output")
     args = parser.parse_args()
 

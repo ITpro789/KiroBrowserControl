@@ -19,11 +19,15 @@
 
 const WS_URL = 'ws://127.0.0.1:8766';
 const PING_INTERVAL_MS = 10000;
-const RECONNECT_DELAY_MS = 1500;
+const RECONNECT_MIN_MS = 1500;
+const RECONNECT_MAX_MS = 30000;
 
 let ws = null;
 let pingTimer = null;
 let authed = false;
+let connecting = false;
+let reconnectTimer = null;
+let reconnectDelayMs = RECONNECT_MIN_MS;
 const attachedTabs = new Set();
 
 // ---------------------------------------------------------------------------
@@ -51,8 +55,20 @@ function attachDebugger(tabId) {
       const enable = (domain) =>
         new Promise((r) => chrome.debugger.sendCommand({ tabId }, domain, {}, () => r()));
 
-      Promise.all([enable('Page.enable'), enable('DOM.enable'), enable('Runtime.enable')])
-        .then(() => resolve());
+      Promise.all([
+        enable('Page.enable'),
+        enable('DOM.enable'),
+        enable('Runtime.enable'),
+        // The agent tab is deliberately never the active one, and an unfocused
+        // renderer suppresses :focus styles, autocomplete popups and some
+        // input handlers. Focus emulation makes the page behave as if the user
+        // were looking at it, which background form filling depends on.
+        new Promise((r) => chrome.debugger.sendCommand(
+          { tabId }, 'Emulation.setFocusEmulationEnabled', { enabled: true }, () => {
+            void chrome.runtime.lastError;
+            r();
+          }))
+      ]).then(() => resolve());
     });
   });
 }
@@ -77,48 +93,422 @@ async function detachAll() {
 }
 
 chrome.debugger.onDetach.addListener((source) => {
-  if (source.tabId) attachedTabs.delete(source.tabId);
+  if (source.tabId) {
+    attachedTabs.delete(source.tabId);
+    screencastWaiters.delete(source.tabId);
+  }
 });
 
-chrome.tabs.onRemoved.addListener((tabId) => attachedTabs.delete(tabId));
+// Screencast frames arrive as CDP events rather than command results, so they
+// need a listener and an explicit ack - Chrome stops sending frames otherwise.
+const screencastWaiters = new Map();
+
+chrome.debugger.onEvent.addListener((source, method, params) => {
+  if (!source.tabId) return;
+
+  // Handled even when no command is in flight - a page's own setTimeout(alert)
+  // would otherwise wedge the tab until it is closed.
+  if (method === 'Page.javascriptDialogOpening') {
+    handleDialog(source.tabId, params);
+    return;
+  }
+
+  if (method !== 'Page.screencastFrame') return;
+
+  const waiter = screencastWaiters.get(source.tabId);
+  if (waiter) {
+    screencastWaiters.delete(source.tabId);
+    waiter(params);
+  }
+
+  if (params && params.sessionId !== undefined) {
+    chrome.debugger.sendCommand(
+      { tabId: source.tabId },
+      'Page.screencastFrameAck',
+      { sessionId: params.sessionId },
+      () => { void chrome.runtime.lastError; }
+    );
+  }
+});
 
 // ---------------------------------------------------------------------------
-// Tab selection
+// JavaScript dialogs
+//
+// With Page.enable active, Chrome hands alert/confirm/prompt/beforeunload to the
+// debugger client instead of showing the native dialog. If nobody answers, the
+// renderer blocks forever: the navigation never completes, waitForLoad spins out
+// and the screenshot times out. So every dialog must be answered.
+// ---------------------------------------------------------------------------
+
+const dialogPolicy = new Map();     // tabId -> 'accept' | 'dismiss', one command
+const dialogPromptText = new Map(); // tabId -> text to submit to a prompt()
+const dialogLog = new Map();        // tabId -> dialogs seen during this command
+
+function defaultDialogAction(type) {
+  // alert has a single button, and beforeunload only fires because the agent
+  // asked to navigate, so leaving is exactly what was intended.
+  if (type === 'alert' || type === 'beforeunload') return 'accept';
+
+  // confirm and prompt are decisions with consequences. "Delete all records?"
+  // is indistinguishable from "Save changes?" at this layer, so cancel unless
+  // the caller explicitly asked to accept via on_dialog.
+  return 'dismiss';
+}
+
+function handleDialog(tabId, params) {
+  const type = (params && params.type) || 'unknown';
+  const action = dialogPolicy.get(tabId) || defaultDialogAction(type);
+  const accept = action === 'accept';
+
+  const log = dialogLog.get(tabId) || [];
+  log.push({
+    type,
+    message: String((params && params.message) || '').slice(0, 300),
+    handled: action,
+    default_used: !dialogPolicy.has(tabId)
+  });
+  dialogLog.set(tabId, log);
+
+  const args = { accept };
+  if (type === 'prompt' && accept) {
+    args.promptText = dialogPromptText.get(tabId) || '';
+  }
+
+  chrome.debugger.sendCommand({ tabId }, 'Page.handleJavaScriptDialog', args, () => {
+    void chrome.runtime.lastError;
+  });
+}
+
+function nextScreencastFrame(tabId, ms) {
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => {
+      screencastWaiters.delete(tabId);
+      resolve(null);
+    }, ms);
+    screencastWaiters.set(tabId, (params) => {
+      clearTimeout(timer);
+      resolve(params);
+    });
+  });
+}
+
+chrome.tabs.onRemoved.addListener((tabId) => {
+  attachedTabs.delete(tabId);
+  screencastWaiters.delete(tabId);
+  dialogPolicy.delete(tabId);
+  dialogPromptText.delete(tabId);
+  dialogLog.delete(tabId);
+  if (tabId === agentTabId) forgetAgentTab();
+});
+
+// ---------------------------------------------------------------------------
+// Agent workspace
+//
+// Driving whichever tab the user happens to be looking at makes the browser
+// unusable while the agent works. Instead the agent owns one tab of its own,
+// held in a labelled "Kiro" tab group and never activated, so the user keeps
+// their own tab focused and can carry on browsing.
+//
+// Passing tab_id explicitly still targets any tab, and 'focus_tab' brings the
+// agent tab forward when the user needs to see or take over from it.
 // ---------------------------------------------------------------------------
 
 const INTERNAL_PREFIXES = ['chrome://', 'edge://', 'about:', 'chrome-extension://', 'devtools://'];
+const AGENT_GROUP_TITLE = 'Kiro';
+const AGENT_GROUP_COLOR = 'cyan';
+
+let agentTabId = null;
+
+// Where to hand focus back to if anything ever has to foreground the agent tab.
+let lastUserTabId = null;
+
+// Opt-in via the popup. Off by default: the whole point is not to take over.
+let stealFocus = false;
+
+chrome.storage.local.get('bridgeStealFocus').then(({ bridgeStealFocus }) => {
+  stealFocus = !!bridgeStealFocus;
+}).catch(() => {});
+
+// Rehydrate on every worker start, so the popup and getAllTabs know which tab
+// is the agent's before any command has run.
+chrome.storage.session.get('agentTabId').then(({ agentTabId: stored }) => {
+  if (stored && !agentTabId) agentTabId = stored;
+}).catch(() => {});
+
+chrome.storage.onChanged.addListener((changes, area) => {
+  if (area === 'local' && changes.bridgeStealFocus) {
+    stealFocus = !!changes.bridgeStealFocus.newValue;
+  }
+});
 
 function isAutomatable(url) {
   return !!url && !INTERNAL_PREFIXES.some((p) => url.startsWith(p));
 }
 
-async function getTargetTab(cmd) {
-  const allTabs = await chrome.tabs.query({});
+async function getTabOrNull(tabId) {
+  if (!tabId) return null;
+  try {
+    return await chrome.tabs.get(tabId);
+  } catch (e) {
+    return null;
+  }
+}
 
-  if (cmd && cmd.tab_id) {
-    const found = allTabs.find((t) => t.id === cmd.tab_id);
-    if (found) return found;
+/**
+ * MV3 tears the service worker down after ~30s idle, so module state cannot be
+ * trusted between commands. Two independent records survive that: session
+ * storage, and the tab group label itself. Both are needed - storage is exact
+ * but cleared when Chrome restarts, and the group label survives that.
+ *
+ * Getting this wrong is not cosmetic. Losing the id used to fall through to
+ * "any automatable tab", which silently hijacked whatever the user had open.
+ */
+async function rememberAgentTab(tabId) {
+  agentTabId = tabId;
+  try {
+    await chrome.storage.session.set({ agentTabId: tabId });
+  } catch (e) { /* session storage unavailable */ }
+}
+
+async function forgetAgentTab() {
+  agentTabId = null;
+  try {
+    await chrome.storage.session.remove('agentTabId');
+  } catch (e) { /* nothing to do */ }
+}
+
+async function recallAgentTab() {
+  try {
+    const { agentTabId: stored } = await chrome.storage.session.get('agentTabId');
+    if (stored) {
+      const tab = await getTabOrNull(stored);
+      if (tab) return tab;
+    }
+  } catch (e) { /* fall through to the group lookup */ }
+  return null;
+}
+
+async function findGroupedAgentTab() {
+  if (!chrome.tabGroups) return null;
+  try {
+    const groups = await chrome.tabGroups.query({ title: AGENT_GROUP_TITLE });
+    for (const group of groups) {
+      const tabs = await chrome.tabs.query({ groupId: group.id });
+      if (tabs.length) {
+        return tabs.find((t) => isAutomatable(t.url)) || tabs[0];
+      }
+    }
+  } catch (e) { /* tabGroups unavailable */ }
+  return null;
+}
+
+async function pickHostWindowId() {
+  try {
+    const win = await chrome.windows.getLastFocused();
+    if (win && win.type === 'normal') return win.id;
+  } catch (e) { /* no focused window */ }
+  try {
+    const wins = await chrome.windows.getAll({});
+    const normal = wins.find((w) => w.type === 'normal');
+    if (normal) return normal.id;
+  } catch (e) { /* none open */ }
+  return null;
+}
+
+async function ensureAgentTab() {
+  let tab = await getTabOrNull(agentTabId);
+  if (tab) return { tab, source: 'memory' };
+
+  tab = await recallAgentTab();
+  if (tab) {
+    await rememberAgentTab(tab.id);
+    return { tab, source: 'session' };
   }
 
-  const [activeTab] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
-  if (activeTab && isAutomatable(activeTab.url)) return activeTab;
+  tab = await findGroupedAgentTab();
+  if (tab) {
+    await rememberAgentTab(tab.id);
+    return { tab, source: 'group' };
+  }
 
-  return allTabs.find((t) => isAutomatable(t.url)) || activeTab || allTabs[0] || null;
+  const windowId = await pickHostWindowId();
+  const created = await chrome.tabs.create({
+    url: 'about:blank',
+    active: false,               // never pull focus off the user's tab
+    ...(windowId ? { windowId } : {})
+  });
+  await rememberAgentTab(created.id);
+
+  try {
+    const groupId = await chrome.tabs.group({ tabIds: created.id });
+    await chrome.tabGroups.update(groupId, {
+      title: AGENT_GROUP_TITLE,
+      color: AGENT_GROUP_COLOR,
+      collapsed: false
+    });
+  } catch (e) {
+    // Grouping is cosmetic, but without it the label-based recovery above stops
+    // working, so it is worth surfacing.
+    console.warn('[bridge] could not group agent tab:', e && e.message);
+  }
+
+  return { tab: (await getTabOrNull(created.id)) || created, source: 'created' };
+}
+
+async function getTargetTab(cmd) {
+  if (cmd && cmd.tab_id) {
+    const found = await getTabOrNull(cmd.tab_id);
+    if (found) return { tab: found, source: 'tab_id' };
+    return { tab: null, source: 'tab_id_missing' };
+  }
+
+  // Deliberately no "any tab will do" fallback. Driving a tab the user is
+  // using, without being asked to, is worse than returning an error.
+  return ensureAgentTab();
 }
 
 async function getAllTabs() {
   const tabs = await chrome.tabs.query({});
-  return tabs.map((t) => ({ id: t.id, title: t.title, url: t.url, active: t.active }));
+  return tabs.map((t) => ({
+    id: t.id,
+    title: t.title,
+    url: t.url,
+    active: t.active,
+    agent: t.id === agentTabId
+  }));
+}
+
+async function waitForLoad(tabId, timeoutMs = 12000) {
+  const started = Date.now();
+  while (Date.now() - started < timeoutMs) {
+    const t = await getTabOrNull(tabId);
+    if (!t) return;
+    if (t.status === 'complete') {
+      await new Promise((r) => setTimeout(r, 350));
+      return;
+    }
+    await new Promise((r) => setTimeout(r, 150));
+  }
 }
 
 // ---------------------------------------------------------------------------
 // Actions
 // ---------------------------------------------------------------------------
 
+const CAPTURE_TIMEOUT_MS = 8000;
+
+function withTimeout(promise, ms, label) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms);
+    promise.then(
+      (v) => { clearTimeout(timer); resolve(v); },
+      (e) => { clearTimeout(timer); reject(e); }
+    );
+  });
+}
+
+function captureFrame(tabId) {
+  // Keep the parameters minimal. captureBeyondViewport in particular never
+  // returns here, in either a background or a foreground tab.
+  return withTimeout(
+    sendCDP(tabId, 'Page.captureScreenshot', { format: 'png' }),
+    CAPTURE_TIMEOUT_MS,
+    'Page.captureScreenshot'
+  ).then(({ data }) => `data:image/png;base64,${data}`);
+}
+
+/**
+ * Screenshot a tab that is not the active one.
+ *
+ * An inactive tab has no compositor surface, so a plain Page.captureScreenshot
+ * either hangs or comes back empty. Overriding device metrics forces the
+ * renderer to produce frames regardless of visibility, which is what makes
+ * background capture possible at all. If that still fails we briefly activate
+ * the tab and hand focus straight back.
+ */
 async function captureScreenshot(tabId) {
   await attachDebugger(tabId);
-  const { data } = await sendCDP(tabId, 'Page.captureScreenshot', { format: 'png' });
-  return `data:image/png;base64,${data}`;
+
+  const target = await getTabOrNull(tabId);
+  if (target && target.active) {
+    // Already the visible tab, so the ordinary path works.
+    return { data: await captureFrame(tabId), mode: 'visible' };
+  }
+
+  // A hidden tab has no compositor, so Page.captureScreenshot waits forever for
+  // a frame that is never produced. Starting a screencast increments Chrome's
+  // capturer count on the WebContents, which forces it to composite while
+  // hidden - the same mechanism tab capture relies on. Emulation overrides do
+  // not achieve this; only a capturer does.
+  let backgroundError = null;
+  let screencasting = false;
+  const framePromise = nextScreencastFrame(tabId, CAPTURE_TIMEOUT_MS);
+
+  try {
+    await sendCDP(tabId, 'Page.startScreencast', {
+      format: 'jpeg', quality: 80, everyNthFrame: 1
+    });
+    screencasting = true;
+  } catch (e) {
+    backgroundError = `startScreencast: ${(e && e.message) || e}`;
+  }
+
+  let shot = null;
+  let mode = null;
+
+  if (screencasting) {
+    try {
+      shot = await captureFrame(tabId);
+      mode = 'background';
+    } catch (e) {
+      backgroundError = String((e && e.message) || e);
+    }
+
+    if (!shot) {
+      // Fall back to the screencast's own frame. Lower fidelity than a PNG but
+      // it is a true picture of the page and costs no focus change.
+      const frame = await framePromise;
+      if (frame && frame.data) {
+        shot = `data:image/jpeg;base64,${frame.data}`;
+        mode = 'background-screencast';
+      }
+    }
+
+    try { await sendCDP(tabId, 'Page.stopScreencast', {}); } catch (e) {}
+  }
+
+  screencastWaiters.delete(tabId);
+
+  if (shot) {
+    return { data: shot, mode, ...(backgroundError ? { backgroundError } : {}) };
+  }
+
+  const data = await captureWithTemporaryFocus(tabId, backgroundError);
+  return { data, mode: 'focused', backgroundError };
+}
+
+async function captureWithTemporaryFocus(tabId, originalError) {
+  let restoreTabId = null;
+  try {
+    const target = await chrome.tabs.get(tabId);
+    const [wasActive] = await chrome.tabs.query({ active: true, windowId: target.windowId });
+
+    // If the agent tab is somehow already active, fall back to the last tab the
+    // user chose themselves. Without this the tab stays foregrounded after the
+    // first fallback and every later capture leaves it there.
+    if (wasActive && wasActive.id !== tabId) restoreTabId = wasActive.id;
+    else if (lastUserTabId && lastUserTabId !== tabId) restoreTabId = lastUserTabId;
+
+    await chrome.tabs.update(tabId, { active: true });
+    await new Promise((r) => setTimeout(r, 250));
+    return await captureFrame(tabId);
+  } catch (e) {
+    throw new Error(originalError ? `${originalError}; focused retry: ${e.message}` : e.message);
+  } finally {
+    if (restoreTabId) {
+      try { await chrome.tabs.update(restoreTabId, { active: true }); } catch (e) {}
+    }
+  }
 }
 
 async function clickAt(tabId, x, y) {
@@ -295,15 +685,49 @@ async function formInput(tabId, target, value) {
 
 async function handleCommand(cmd) {
   const action = cmd.action || 'get_state';
-  const tab = await getTargetTab(cmd);
+
+  let tab = null;
+  let tabSource = 'unknown';
+  try {
+    const picked = await getTargetTab(cmd);
+    tab = picked.tab;
+    tabSource = picked.source;
+  } catch (e) {
+    return {
+      status: 'error',
+      error: `could not open the agent tab: ${(e && e.message) || e}`,
+      tabs: await getAllTabs()
+    };
+  }
 
   if (!tab || !tab.id) {
-    return { status: 'error', error: 'no automatable tab found', tabs: await getAllTabs() };
+    return {
+      status: 'error',
+      error: tabSource === 'tab_id_missing'
+        ? `tab_id ${cmd.tab_id} does not exist`
+        : 'no agent tab available',
+      tabs: await getAllTabs()
+    };
   }
   const tabId = tab.id;
 
+  // Set before the action, because the dialog opens while the action is running.
+  dialogLog.delete(tabId);
+  if (cmd.on_dialog === 'accept' || cmd.on_dialog === 'dismiss') {
+    dialogPolicy.set(tabId, cmd.on_dialog);
+  } else {
+    dialogPolicy.delete(tabId);
+  }
+  if (typeof cmd.dialog_text === 'string') {
+    dialogPromptText.set(tabId, cmd.dialog_text);
+  } else {
+    dialogPromptText.delete(tabId);
+  }
+
   try {
-    if (action !== 'get_state') {
+    // Focus is only taken when the user has opted in from the popup, or when
+    // they explicitly asked for it via focus_tab.
+    if (stealFocus && action !== 'get_state') {
       try {
         await chrome.tabs.update(tabId, { active: true });
         await chrome.windows.update(tab.windowId, { focused: true });
@@ -322,7 +746,9 @@ async function handleCommand(cmd) {
         // alone mangled file://, chrome:// and about: URLs into https://file///...
         if (!/^[a-z][a-z0-9+.-]*:/i.test(url)) url = 'https://' + url;
         await chrome.tabs.update(tabId, { url });
-        await new Promise((r) => setTimeout(r, 1800));
+        // A background tab loads on its own schedule, so wait on the real load
+        // state instead of guessing with a fixed sleep.
+        await waitForLoad(tabId);
         break;
       }
 
@@ -368,7 +794,17 @@ async function handleCommand(cmd) {
       }
 
       case 'switch_tab':
-        // Focus already handled above via cmd.tab_id.
+        // Explicitly adopting a tab makes it the agent's working tab from now
+        // on, so follow-up commands without a tab_id land on the same page.
+        if (cmd.tab_id) await rememberAgentTab(tabId);
+        break;
+
+      case 'focus_tab':
+        await chrome.tabs.update(tabId, { active: true });
+        try {
+          await chrome.windows.update(tab.windowId, { focused: true });
+        } catch (e) { /* window may be minimised */ }
+        await new Promise((r) => setTimeout(r, 250));
         break;
 
       case 'eval': {
@@ -386,18 +822,53 @@ async function handleCommand(cmd) {
 
     const current = await chrome.tabs.get(tabId);
     const elements = await annotate(tabId);
-    const screenshot = await captureScreenshot(tabId);
+
+    // The element list is useful on its own, so a capture failure degrades the
+    // response rather than failing the whole command.
+    let screenshot = '';
+    let screenshotError = null;
+    let screenshotMode = null;
+    let backgroundCaptureError = null;
+    try {
+      const shot = await captureScreenshot(tabId);
+      screenshot = shot.data;
+      screenshotMode = shot.mode;
+      backgroundCaptureError = shot.backgroundError || null;
+    } catch (e) {
+      screenshotError = String((e && e.message) || e);
+    }
 
     return {
       status: 'ok',
-      tab: { id: current.id, title: current.title, url: current.url },
+      tab: {
+        id: current.id,
+        title: current.title,
+        url: current.url,
+        agent: current.id === agentTabId,
+        active: current.active,
+        source: tabSource
+      },
       tabs: await getAllTabs(),
       interactive_elements_count: elements.length,
       elements,
-      screenshot
+      ...(dialogLog.get(tabId)?.length ? { dialogs: dialogLog.get(tabId) } : {}),
+      screenshot,
+      ...(screenshotMode ? { screenshot_mode: screenshotMode } : {}),
+      ...(backgroundCaptureError ? { background_capture_error: backgroundCaptureError } : {}),
+      ...(screenshotError ? { screenshot_error: screenshotError } : {})
     };
   } catch (err) {
-    return { status: 'error', error: String(err && err.message || err), tabs: await getAllTabs() };
+    return {
+      status: 'error',
+      error: String(err && err.message || err),
+      ...(dialogLog.get(tabId)?.length ? { dialogs: dialogLog.get(tabId) } : {}),
+      tabs: await getAllTabs()
+    };
+  } finally {
+    // Policy is per command. Leaking it would silently apply an "accept" the
+    // caller asked for once to every later action on this tab.
+    dialogPolicy.delete(tabId);
+    dialogPromptText.delete(tabId);
   }
 }
 
@@ -406,57 +877,112 @@ async function handleCommand(cmd) {
 // ---------------------------------------------------------------------------
 
 async function getToken() {
-  const { bridgeToken } = await chrome.storage.local.get('bridgeToken');
-  if (bridgeToken) return bridgeToken;
-
-  // Fall back to token.json, written into this folder by install.ps1, so the
-  // extension self-pairs with no manual step. The file is not listed in
-  // web_accessible_resources, so no web page can read it; a local process that
-  // could read it could equally read .bridge-token, so this costs nothing in
-  // terms of the threat this token defends against.
+  // token.json is authoritative when present. install.ps1 regenerates the secret
+  // on every run, so preferring the cached copy in chrome.storage.local would
+  // leave the extension authenticating with a stale token after a re-install -
+  // which presents as "extension not connected" with a bad-token rejection in
+  // the server log.
+  //
+  // The file is not listed in web_accessible_resources, so no web page can read
+  // it. A local process able to read it could read .bridge-token anyway, so this
+  // costs nothing against the threat the token defends against.
   try {
     const resp = await fetch(chrome.runtime.getURL('token.json'));
     if (resp.ok) {
       const data = await resp.json();
       if (data && data.token) {
-        await chrome.storage.local.set({ bridgeToken: data.token });
-        console.log('[bridge] paired from token.json');
+        const { bridgeToken } = await chrome.storage.local.get('bridgeToken');
+        if (bridgeToken !== data.token) {
+          await chrome.storage.local.set({ bridgeToken: data.token });
+          console.log('[bridge] paired from token.json (token changed)');
+        }
         return data.token;
       }
     }
   } catch (e) {
-    // No bundled token; the popup can still be used.
+    // No bundled token - fall through to whatever the popup stored.
   }
-  return null;
+
+  const { bridgeToken } = await chrome.storage.local.get('bridgeToken');
+  return bridgeToken || null;
+}
+
+/**
+ * Chrome writes a console error for every refused WebSocket, and the bridge
+ * being stopped is a normal state, so retry with backoff instead of hammering
+ * the port every 1.5s and filling the log with red.
+ */
+function scheduleReconnect() {
+  if (reconnectTimer) return;
+  reconnectTimer = setTimeout(() => {
+    reconnectTimer = null;
+    connect();
+  }, reconnectDelayMs);
+  reconnectDelayMs = Math.min(reconnectDelayMs * 2, RECONNECT_MAX_MS);
 }
 
 async function connect() {
+  if (connecting) return;
   if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) return;
 
-  const token = await getToken();
+  // Claimed synchronously, before the first await. getToken() yields, and
+  // connect() is driven by several frequently-firing tab and window listeners,
+  // so without this two sockets race: the loser's onopen then fires and calls
+  // send() on the module-level `ws`, which by then is the winner's socket and
+  // still CONNECTING. That is the InvalidStateError.
+  connecting = true;
+
+  let token = null;
+  try {
+    token = await getToken();
+  } catch (e) {
+    connecting = false;
+    scheduleReconnect();
+    return;
+  }
+
   if (!token) {
+    connecting = false;
     console.warn('[bridge] no token set - open the extension popup and paste the bridge token');
     return;
   }
 
+  let socket;
   try {
-    ws = new WebSocket(WS_URL);
+    socket = new WebSocket(WS_URL);
   } catch (e) {
-    setTimeout(connect, 2000);
+    connecting = false;
+    scheduleReconnect();
     return;
   }
 
+  ws = socket;
   authed = false;
+  connecting = false;
 
-  ws.onopen = () => {
-    ws.send(JSON.stringify({ type: 'auth', token }));
+  // Handlers act on their own socket and bail if it has since been replaced, so
+  // a superseded connection can never touch shared state.
+  const isCurrent = () => ws === socket;
+
+  socket.onopen = () => {
+    if (!isCurrent()) {
+      try { socket.close(); } catch (e) {}
+      return;
+    }
+    reconnectDelayMs = RECONNECT_MIN_MS;
+    socket.send(JSON.stringify({ type: 'auth', token }));
+
     if (pingTimer) clearInterval(pingTimer);
     pingTimer = setInterval(() => {
-      if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: 'ping' }));
+      if (isCurrent() && socket.readyState === WebSocket.OPEN) {
+        socket.send(JSON.stringify({ type: 'ping' }));
+      }
     }, PING_INTERVAL_MS);
   };
 
-  ws.onmessage = async (event) => {
+  socket.onmessage = async (event) => {
+    if (!isCurrent()) return;
+
     let msg;
     try { msg = JSON.parse(event.data); } catch (e) { return; }
 
@@ -467,7 +993,7 @@ async function connect() {
     }
     if (msg.type === 'auth_failed') {
       console.error('[bridge] token rejected - re-paste the token in the popup');
-      try { ws.close(); } catch (e) {}
+      try { socket.close(); } catch (e) {}
       return;
     }
     if (msg.type === 'pong') return;
@@ -476,20 +1002,36 @@ async function connect() {
 
     const result = await handleCommand(msg);
     result.command_id = msg.command_id;
-    try { ws.send(JSON.stringify(result)); } catch (e) {}
+    if (socket.readyState === WebSocket.OPEN) {
+      try { socket.send(JSON.stringify(result)); } catch (e) {}
+    }
   };
 
-  ws.onclose = () => {
+  socket.onclose = () => {
+    if (!isCurrent()) return;
     authed = false;
     if (pingTimer) { clearInterval(pingTimer); pingTimer = null; }
-    setTimeout(connect, RECONNECT_DELAY_MS);
+    scheduleReconnect();
   };
 
-  ws.onerror = () => { try { ws.close(); } catch (e) {} };
+  socket.onerror = () => { try { socket.close(); } catch (e) {} };
 }
 
 function ensureConnected() {
-  if (!ws || ws.readyState !== WebSocket.OPEN) connect();
+  // A queued retry is honoured rather than pre-empted, otherwise the tab and
+  // window listeners bypass the backoff and reconnect every few hundred ms.
+  if (reconnectTimer || connecting) return;
+  if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) return;
+  connect();
+}
+
+function reconnectNow() {
+  if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+  reconnectDelayMs = RECONNECT_MIN_MS;
+  const stale = ws;
+  ws = null;
+  try { if (stale) stale.close(); } catch (e) {}
+  return connect();
 }
 
 chrome.alarms.create('keepAlive', { periodInMinutes: 0.5 });
@@ -504,12 +1046,35 @@ chrome.runtime.onConnect.addListener((port) => {
 
 chrome.runtime.onMessage.addListener((msg, _sender, reply) => {
   if (msg && msg.type === 'status') {
-    reply({ connected: !!ws && ws.readyState === WebSocket.OPEN, authed, attached: attachedTabs.size });
+    reply({
+      connected: !!ws && ws.readyState === WebSocket.OPEN,
+      authed,
+      attached: attachedTabs.size,
+      agentTabId,
+      stealFocus
+    });
+    return true;
+  }
+  if (msg && msg.type === 'show_agent_tab') {
+    ensureAgentTab()
+      .then(async ({ tab }) => {
+        await chrome.tabs.update(tab.id, { active: true });
+        try { await chrome.windows.update(tab.windowId, { focused: true }); } catch (e) {}
+        reply({ ok: true, tabId: tab.id });
+      })
+      .catch((e) => reply({ ok: false, error: String(e && e.message || e) }));
+    return true;
+  }
+  if (msg && msg.type === 'close_agent_tab') {
+    const id = agentTabId;
+    forgetAgentTab().then(() => {
+      if (!id) return reply({ ok: true });
+      chrome.tabs.remove(id).then(() => reply({ ok: true })).catch(() => reply({ ok: true }));
+    });
     return true;
   }
   if (msg && msg.type === 'reconnect') {
-    try { if (ws) ws.close(); } catch (e) {}
-    connect().then(() => reply({ ok: true }));
+    reconnectNow().then(() => reply({ ok: true }));
     return true;
   }
   if (msg && msg.type === 'detach_all') {
@@ -519,7 +1084,10 @@ chrome.runtime.onMessage.addListener((msg, _sender, reply) => {
   return false;
 });
 
-chrome.tabs.onActivated.addListener(ensureConnected);
+chrome.tabs.onActivated.addListener((info) => {
+  if (info && info.tabId && info.tabId !== agentTabId) lastUserTabId = info.tabId;
+  ensureConnected();
+});
 chrome.tabs.onUpdated.addListener(ensureConnected);
 chrome.windows.onFocusChanged.addListener(ensureConnected);
 chrome.runtime.onStartup.addListener(ensureConnected);

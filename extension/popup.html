@@ -25,9 +25,13 @@
     border: 1px solid #8886; background: #8881; cursor: pointer;
   }
   button:hover { background: #8883; }
-  .actions { display: flex; gap: 6px; margin-top: 10px; }
+  .actions { display: flex; gap: 6px; margin-top: 10px; flex-wrap: wrap; }
   .muted { font-size: 11px; opacity: .65; margin-top: 10px; }
   .warn { font-size: 11px; color: #b9271f; margin-top: 8px; display: none; }
+  hr { border: 0; border-top: 1px solid #8883; margin: 14px 0 10px; }
+  .check { display: flex; align-items: flex-start; gap: 7px; margin-top: 10px; }
+  .check input { margin: 2px 0 0; flex: none; }
+  .check span { font-size: 12px; }
 </style>
 </head>
 <body>
@@ -53,6 +57,29 @@
   <div class="muted">
     The token is printed by <code>bridge_server.py --server</code> on first run
     and stored in <code>.bridge-token</code>.
+  </div>
+
+  <hr>
+
+  <label>Agent tab</label>
+  <div id="agentState" class="muted" style="margin-top:2px">no tab yet</div>
+
+  <div class="actions">
+    <button id="show">Show Kiro tab</button>
+    <button id="close">Close it</button>
+  </div>
+
+  <div class="check">
+    <input type="checkbox" id="stealFocus">
+    <span>
+      <label for="stealFocus" style="text-transform:none;letter-spacing:0;opacity:1;font-size:12px;margin:0">
+        Bring the tab to the front while working
+      </label>
+      <span class="muted" style="display:block;margin-top:2px">
+        Off by default. The agent works in a background tab in the
+        <strong>Kiro</strong> group so you can keep browsing.
+      </span>
+    </span>
   </div>
 
   <script src="popup.js"></script>

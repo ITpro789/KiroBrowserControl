@@ -73,11 +73,57 @@ Flags:
 | `browser_fill` | Set a field by number or CSS selector — React-safe |
 | `browser_key` | Press a named key |
 | `browser_scroll` | Scroll up or down |
-| `browser_list_tabs` | List open tabs with ids |
+| `browser_list_tabs` | List open tabs with ids; `[agent]` marks the Kiro tab |
+| `browser_use_tab` | Adopt a tab you already have open as the working tab |
+| `browser_focus_tab` | Bring the working tab to the front |
 | `browser_eval` | Run JS — requires `-AllowEval` |
+
+`browser_navigate`, `browser_click`, `browser_type`, `browser_fill` and
+`browser_key` also take `on_dialog` and `dialog_text`. See below.
 
 Element numbers are invalidated by any page change. Call `browser_get_state`
 again after every action.
+
+---
+
+## It works in the background, not in your tab
+
+The agent gets a tab of its own, in a tab group labelled **Kiro**, created on
+first use. It is never activated, so you keep your own tab focused and carry on
+browsing while the agent clicks around.
+
+<p align="center"><code>[ your tab ] [ your tab ] [ Kiro ▸ agent tab ]</code></p>
+
+- Nothing takes focus. No tab switching under your cursor, no window raising.
+- `browser_focus_tab` is the one exception, for when you have to sign in or
+  clear a CAPTCHA yourself. The agent is told to say why before calling it.
+- The popup has **Show Kiro tab** and **Close it**, plus an opt-in
+  *Bring the tab to the front while working* checkbox if you would rather watch.
+- Ask the agent to work on a page you already have open and it will call
+  `browser_use_tab` on that tab instead.
+
+Two things behave differently in a hidden tab, and both are handled:
+
+**Screenshots.** A hidden tab has no compositor, so `Page.captureScreenshot`
+waits forever for a frame that never arrives. Emulation overrides do not fix
+this. What does is starting a `Page.startScreencast` session first: that
+increments Chrome's capturer count on the `WebContents`, which forces it to
+composite while hidden — the same mechanism tab capture uses. The screenshot is
+then a normal full-fidelity PNG. If it still fails, the screencast's own JPEG
+frame is used, and only as a last resort is the tab briefly foregrounded, which
+the response reports so the agent can tell you.
+
+**Focus-dependent behaviour.** An unfocused renderer suppresses `:focus`
+styles, autocomplete popups and some input handlers.
+`Emulation.setFocusEmulationEnabled` makes the page behave as if you were
+looking at it. Timers are still throttled and `requestAnimationFrame` is still
+paused in a hidden tab, so a page mid-animation can screenshot half-rendered;
+re-reading state resolves it.
+
+The working tab id is held in `chrome.storage.session` and recoverable from the
+group label, because the MV3 service worker is torn down every ~30s. Without
+both, the agent loses track of its tab and starts driving whichever one you are
+using.
 
 ---
 
@@ -87,7 +133,7 @@ again after every action.
   Kiro
    │  stdio JSON-RPC (MCP)
    ▼
-  scripts/mcp_server.py        9 tools, standard library only
+  scripts/mcp_server.py        11 tools, standard library only
    │  HTTP :8765 + X-Bridge-Token
    ▼
   scripts/bridge_server.py     auth, origin checks, request correlation

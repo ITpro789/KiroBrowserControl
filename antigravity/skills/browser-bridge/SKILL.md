@@ -12,7 +12,7 @@ This skill equips Antigravity with full, bi-directional control over the user's 
 ## 🚨 MANDATORY EXECUTION RULES FOR THE AGENT
 
 1. **NEVER BYPASS THE BROWSER**: When `/browser-bridge`, `/browser`, or browser tasks are invoked, **NEVER switch to background curl/REST scripts or headless tools**. The user wants to see the actual Chrome UI being operated.
-2. **BACKGROUND TAB ISOLATION (ZERO FOCUS STEALING)**: The browser operates in a dedicated background tab group. When Antigravity uses it, the tab group badge in Chrome dynamically changes to **`[ AG ]`** (blue). When Kiro uses it, it displays **`[ Kiro ]`** (cyan). The user's active browsing tab is never interrupted.
+2. **BACKGROUND TAB ISOLATION (ZERO FOCUS STEALING)**: The browser operates in a dedicated background tab group. When Antigravity uses it, the tab group badge in Chrome dynamically changes to **`[ AG ]`** (blue). When Kiro uses it, it displays **`[ Kiro ]`** (cyan). The user's active browsing tab is never interrupted. **NEVER call `browser_focus_tab` unless the user explicitly asks you to bring the browser forward for manual CAPTCHA or 2FA.**
 3. **ALWAYS SHOW SCREENSHOTS & BADGES**: Every browser action captures `browser_view.png` (using Chrome screencast compositing) and references visual badges `[1]`, `[2]`, `[3]`.
 4. **UNIFIED MCP & CLI ACCESS**:
    - Registered as native MCP server `browser-bridge` in `~/.gemini/config/mcp_config.json`.

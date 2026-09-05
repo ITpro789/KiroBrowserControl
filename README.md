@@ -1,82 +1,65 @@
-# Kiro Browser Control
+# Kiro-AG Browser Control (Universal)
 
-Gives the [Kiro](https://kiro.dev) agent control of your **real, logged-in Chrome** —
-navigate, click, fill forms, read pages, screenshot — through MCP tools.
+Universal, background browser automation for both **[Antigravity (AG)](https://antigravity.dev)** and **[Kiro](https://kiro.dev)** using your **real, logged-in Chrome** — navigate, click by numbered badges, fill forms, read markdown, track errors, screenshot — through standard MCP tools.
 
 No separate profile. No logging back in. It drives the browser you already use.
+
+---
+
+## Universal Multi-Agent Tab Branding
+
+When either agent executes commands, the extension dynamically brands the background tab group:
+- **Antigravity (AG)**: Tab group is labeled **`AG`** with a **Blue** color tag.
+- **Kiro**: Tab group is labeled **`Kiro`** with a **Cyan** color tag.
+
+Both agents multiplex through the single secure bridge daemon on ports `8765` (HTTP) and `8766` (WebSocket) with zero port conflicts.
 
 ---
 
 ## Quick start
 
 ```powershell
-git clone https://github.com/ITpro789/KiroBrowserControl.git
-cd KiroBrowserControl
+git clone https://github.com/ITpro789/Kiri-AG-BrowserControl.git
+cd Kiri-AG-BrowserControl
 .\install.ps1
 ```
 
-Then the one thing a script cannot do:
+`.\install.ps1` automatically:
+- Installs dependencies (`websockets`, `Pillow`).
+- Generates secure shared secrets.
+- Registers the MCP server and skill in **Kiro** (`~/.kiro/`).
+- Registers the MCP server and skill in **Antigravity** (`~/.gemini/`).
+- Creates a silent Windows Scheduled Task (`pythonw.exe` headless background daemon).
 
-1. `chrome://extensions`
-2. **Developer mode** on (top right)
-3. **Load unpacked** → select the `extension` folder (the installer copies the path to your clipboard)
+Then the **one** manual step:
 
-Start a new Kiro chat and ask *"what tabs do I have open?"*
-
----
-
-## If you are Kiro reading this
-
-You have been pointed at this repo to set up browser control. Do this:
-
-1. Run `.\install.ps1` from the repo root. It is idempotent.
-2. Report the manual step to the user: load `extension\` unpacked at `chrome://extensions`.
-3. Tell them to start a **new** chat session — MCP servers and skills are discovered at session start.
-4. Verify with `browser_list_tabs`. If it returns `extension not connected`, the extension is not loaded or needs a reload.
-
-Do not paste tokens anywhere. `install.ps1` embeds the secret in `extension/token.json` and the extension pairs itself.
+1. Open `chrome://extensions`
+2. Turn **Developer mode** ON (top right)
+3. Click **Load unpacked** → select the `extension` folder (`Kiro-AG-Browser`)
+4. Start a new chat session in Kiro or Antigravity! All 16 tools and skills (`/browser-control` and `/browser-bridge`) will be instantly ready.
 
 ---
 
-## What install.ps1 does
+## Tools Available
 
-| Step | Action |
+| Tool | Description |
 | --- | --- |
-| 1 | Finds Python 3.8+ (`python`, `python3` or `py`) |
-| 2 | `pip install websockets` |
-| 3 | Generates a shared secret, embeds it in `extension/token.json` |
-| 4 | Registers the MCP server in `~/.kiro/settings/mcp.json` (backs up any existing file) |
-| 5 | Installs the `browser-control` skill to `~/.kiro/skills/` |
-| 6 | Creates a **logon scheduled task** so the bridge survives reboots |
-| 7 | Starts the bridge, waits for both ports |
-| 8 | Runs 8 security tests and fails loudly if any do not pass |
-
-Flags:
-
-```powershell
-.\install.ps1 -NoLogonTask    # run the bridge manually instead
-.\install.ps1 -AllowEval      # enable browser_eval (arbitrary JS) - off by default
-.\install.ps1 -SkipTests
-.\uninstall.ps1               # removes task, MCP entry, skill, secrets
-```
-
----
-
-## Tools the agent gains
-
-| Tool | Does |
-| --- | --- |
-| `browser_get_state` | URL, title, numbered interactive elements, screenshot |
-| `browser_navigate` | Go to a URL |
-| `browser_click` | Click by element number or x/y |
-| `browser_type` | Type into whatever has focus |
-| `browser_fill` | Set a field by number or CSS selector — React-safe |
-| `browser_key` | Press a named key |
+| `browser_get_state` | URL, title, interactive elements with **visual numbered badges**, and screenshot |
+| `browser_navigate` | Go to any URL |
+| `browser_click` | Click by numbered badge (`1`, `2`, ...) or x/y coordinates |
+| `browser_type` | Type text into whatever element has focus |
+| `browser_fill` | Set an input field by badge ID or CSS selector (React-safe) |
+| `browser_key` | Send named keys (`Enter`, `Tab`, `ArrowDown`) with optional modifiers (`Control`, `Shift`, `Alt`, `Meta`) |
+| `browser_select_option` | Select option in native `<select>` dropdowns or ARIA comboboxes |
+| `browser_read_content` | Extract clean, readable Markdown of page content (strips nav/ads/scripts) |
+| `browser_get_errors` | Return recent JavaScript console errors and failed network requests (HTTP $\ge 400$) |
 | `browser_scroll` | Scroll up or down |
-| `browser_list_tabs` | List open tabs with ids; `[agent]` marks the Kiro tab |
-| `browser_use_tab` | Adopt a tab you already have open as the working tab |
-| `browser_focus_tab` | Bring the working tab to the front |
-| `browser_eval` | Run JS — requires `-AllowEval` |
+| `browser_list_tabs` | List open tabs with IDs and agent markers |
+| `browser_use_tab` | Adopt an existing open tab as the working agent tab |
+| `browser_new_tab` | Open a new tab in the active agent tab group |
+| `browser_close_tab` | Close the agent working tab |
+| `browser_focus_tab` | Bring the working tab to the foreground (for manual logins/captchas) |
+| `browser_eval` | Run arbitrary JavaScript in page context (requires `-AllowEval`) |
 
 `browser_navigate`, `browser_click`, `browser_type`, `browser_fill` and
 `browser_key` also take `on_dialog` and `dialog_text`. See below.
@@ -279,24 +262,27 @@ Custom agents do not load user skills by default. Add to the agent config:
 - Windows 10/11, PowerShell 5.1+
 - Python 3.8+ on PATH
 - Google Chrome 116+
-- Kiro IDE
+- Kiro IDE and/or Antigravity IDE
 
 ## Layout
 
 ```
-install.ps1                     full setup, idempotent
-uninstall.ps1                   removes everything it created
-extension/                      load unpacked in Chrome
-  manifest.json                 MV3: debugger, tabs, scripting, ws:// hosts
-  background.js                 CDP driving, WS client, element discovery
-  content.js                    MV3 keep-alive
-  popup.html / popup.js         status, manual token entry, detach
+install.ps1                              full setup for Kiro & Antigravity (idempotent)
+uninstall.ps1                            removes task, registrations, skills, secrets
+extension/                               load unpacked in Chrome (Developer mode)
+  manifest.json                          MV3: debugger, tabs, scripting, ws:// hosts
+  background.js                          CDP driving, WS client, per-agent tabs, clean capture
+  content.js                             MV3 keep-alive
+  popup.html / popup.js                  status, manual token entry, detach, close tabs
 scripts/
-  bridge_server.py              WS + HTTP bridge, auth, CLI
-  mcp_server.py                 MCP stdio server, 9 tools
-  test_security.py              8 checks on origin and token enforcement
+  bridge_server.py                       WS + HTTP bridge, auth, CLI, offscreen Pillow overlay
+  mcp_server.py                          MCP stdio server, 16 tools
+  test_security.py                       8 checks on origin and token enforcement
 kiro/skills/browser-control/
-  SKILL.md                      installed to ~/.kiro/skills by install.ps1
+  SKILL.md                               installed to ~/.kiro/skills by install.ps1
+antigravity/skills/browser-bridge/
+  SKILL.md                               installed to ~/.gemini/config/skills by install.ps1
+  scripts/bridge_server.py               CLI forwarder with token auth and --client AG
 ```
 
 Credit: architecture based on the Antigravity `browser-bridge` design, with

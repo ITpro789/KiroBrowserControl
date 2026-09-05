@@ -30,6 +30,7 @@ import argparse
 import asyncio
 import base64
 import json
+import os
 import secrets
 import sys
 import threading
@@ -76,12 +77,89 @@ def load_or_create_token() -> str:
 TOKEN = ""
 
 
+def normalise_agent(name) -> str:
+    """One canonical name per agent, so artifacts and tab groups agree."""
+    if str(name or "").strip().lower() in ("ag", "antigravity"):
+        return "AG"
+    return "Kiro"
+
+
+def annotate_image_with_badges(image_bytes: bytes, elements: list):
+    """Returns annotated PNG bytes, or None when Pillow is unavailable."""
+    import io
+
+    try:
+        from PIL import Image, ImageDraw, ImageFont
+    except ImportError:
+        # Reported to the caller rather than swallowed. An agent handed an
+        # unbadged screenshot will try to click badge numbers that are not there.
+        return None
+
+    try:
+
+        img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+        draw = ImageDraw.Draw(img)
+
+        # Select a crisp font
+        font = None
+        for f_name in ["consola.ttf", "arialbd.ttf", "segoeuib.ttf", "calibrib.ttf", "arial.ttf"]:
+            try:
+                font = ImageFont.truetype(f_name, 11)
+                break
+            except Exception:
+                continue
+        if font is None:
+            font = ImageFont.load_default()
+
+        img_w, img_h = img.size
+
+        for el in elements:
+            eid = str(el.get("id", ""))
+            if not eid:
+                continue
+
+            # Position at top-left corner of element if available, else center
+            if "left" in el and "top" in el:
+                x = el["left"]
+                y = el["top"]
+            else:
+                x = el.get("x", 0)
+                y = el.get("y", 0)
+
+            bbox = draw.textbbox((0, 0), eid, font=font)
+            tw = bbox[2] - bbox[0]
+            th = bbox[3] - bbox[1]
+
+            pad_x = 3
+            pad_y = 2
+            bw = tw + pad_x * 2
+            bh = th + pad_y * 2
+
+            # Position badge at (x, y - bh/2) so it rests neatly on the element
+            bx0 = max(0, min(x, img_w - bw))
+            by0 = max(0, min(y - bh // 2, img_h - bh))
+            bx1 = bx0 + bw
+            by1 = by0 + bh
+
+            # Solid yellow fill with 1px black outline
+            draw.rectangle([bx0, by0, bx1, by1], fill="#ffeb3b", outline="#000000", width=1)
+            draw.text((bx0 + pad_x, by0 + pad_y - 1), eid, fill="#000000", font=font)
+
+        out_buf = io.BytesIO()
+        img.save(out_buf, format="PNG")
+        return out_buf.getvalue()
+    except Exception as exc:
+        print(f"[bridge] warning: could not draw badges on image: {exc}")
+        return image_bytes
+
+
 class Bridge:
     """Tracks authenticated extension clients and correlates request/response."""
 
     def __init__(self):
         self.clients = set()
         self.pending = {}
+        self.command_opts = {}
         self.loop = None
 
     async def handle_ws(self, websocket):
@@ -133,17 +211,51 @@ class Bridge:
                     # Background captures come back as JPEG, so the extension is
                     # taken from the data URL rather than assumed to be PNG.
                     suffix = ".jpg" if "image/jpeg" in header else ".png"
+                    cmd_opts = self.command_opts.get(cmd_id, {})
+
+                    # Screenshots are per agent. A single shared browser_view.png
+                    # means two agents overwrite each other, and each then reads
+                    # a picture of the other's page.
+                    agent = normalise_agent(cmd_opts.get("agent_name"))
+                    stem = f"browser_view_{agent.lower()}"
+
                     try:
                         ARTIFACTS.mkdir(parents=True, exist_ok=True)
-                        for stale in ARTIFACTS.glob("browser_view.*"):
+                        for stale in ARTIFACTS.glob(f"{stem}.*"):
                             if stale.suffix != suffix:
                                 stale.unlink(missing_ok=True)
-                        path = ARTIFACTS / f"browser_view{suffix}"
-                        path.write_bytes(base64.b64decode(payload))
+                        path = ARTIFACTS / f"{stem}{suffix}"
+                        clean_path = ARTIFACTS / f"{stem}_clean{suffix}"
+                        raw_bytes = base64.b64decode(payload)
+                        clean_path.write_bytes(raw_bytes)
+                        msg["clean_screenshot_saved"] = str(clean_path)
+
+                        elements = msg.get("elements", [])
+                        show_badges = cmd_opts.get("visual_badges", True)
+
+                        if show_badges and elements:
+                            annotated_bytes = annotate_image_with_badges(raw_bytes, elements)
+                            if annotated_bytes is None:
+                                # Pillow missing. Say so rather than silently
+                                # handing back an unbadged image the agent will
+                                # then try to click by number.
+                                path.write_bytes(raw_bytes)
+                                msg["badges_unavailable"] = (
+                                    "Pillow is not installed, so the screenshot has no "
+                                    "numbered badges. Use the element list instead, or "
+                                    "run: pip install Pillow"
+                                )
+                            else:
+                                path.write_bytes(annotated_bytes)
+                        else:
+                            path.write_bytes(raw_bytes)
+
                         msg["screenshot_saved"] = str(path)
+                        msg["agent_name"] = agent
                     except Exception as exc:
                         msg["screenshot_error"] = str(exc)
 
+                self.command_opts.pop(cmd_id, None)
                 fut = self.pending.pop(cmd_id)
                 if not fut.done():
                     fut.set_result(msg)
@@ -164,6 +276,7 @@ class Bridge:
 
         fut = self.loop.create_future()
         self.pending[cmd_id] = fut
+        self.command_opts[cmd_id] = dict(payload)
         raw = json.dumps(payload)
 
         for client in list(self.clients):
@@ -176,6 +289,7 @@ class Bridge:
             return await asyncio.wait_for(fut, timeout=timeout)
         except asyncio.TimeoutError:
             self.pending.pop(cmd_id, None)
+            self.command_opts.pop(cmd_id, None)
             return {"status": "error", "error": f"timed out after {timeout}s"}
 
 
@@ -249,7 +363,7 @@ def run_server():
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
 
     print("=" * 66)
-    print(" Kiro Browser Bridge")
+    print(" Kiro-AG-Browser Bridge")
     print("=" * 66)
     print(f" HTTP API   http://{HTTP_HOST}:{HTTP_PORT}   (X-Bridge-Token required)")
     print(f" WebSocket  ws://{WS_HOST}:{WS_PORT}     (chrome-extension origin only)")
@@ -273,22 +387,58 @@ def run_server():
         print("\n[bridge] stopped")
 
 
+def sync_brain_artifact(screenshot_path_str: str, tab_info: dict = None):
+    if not screenshot_path_str:
+        return None
+    src = Path(screenshot_path_str)
+    if not src.exists():
+        return None
+    brain_dir = Path.home() / ".gemini" / "antigravity" / "brain"
+    if not brain_dir.exists():
+        return None
+    candidates = [d for d in brain_dir.iterdir() if d.is_dir() and not d.name.startswith(".")]
+    if not candidates:
+        return None
+    candidates.sort(key=lambda d: d.stat().st_mtime, reverse=True)
+    active_brain = candidates[0]
+    dest = active_brain / src.name
+    try:
+        import shutil
+        shutil.copy2(src, dest)
+        md_path = active_brain / "browser_live.md"
+        title = (tab_info or {}).get("title", "Live Browser View")
+        url = (tab_info or {}).get("url", "")
+        norm_dest = str(dest).replace("\\", "/")
+        md_content = f"# Live Browser View (Personal Chrome Session)\n\n**Page Title**: {title}  \n**Current URL**: [{url}]({url})\n\n![Live Screen Capture](file:///{norm_dest})\n"
+        md_path.write_text(md_content, encoding="utf-8")
+        return str(dest)
+    except Exception:
+        return None
+
+
 def run_cli(args):
     import urllib.error
     import urllib.request
 
+    mods = [m.strip() for m in args.modifiers.split(",") if m.strip()] if args.modifiers else None
+
     payload = {
         "action": args.action,
+        "agent_name": args.agent_name,
         "url": args.url or None,
         "target": args.target or None,
+        "value": args.value or None,
         "x": args.x,
         "y": args.y,
         "text": args.text or None,
         "key": args.key,
+        "modifiers": mods,
         "code": args.code,
         "enter": args.enter or None,
         "direction": args.direction,
         "amount": args.amount,
+        "max_length": args.max_length,
+        "visual_badges": not args.no_badges,
         "tab_id": args.tab_id,
         "on_dialog": args.on_dialog,
         "dialog_text": args.dialog_text,
@@ -309,6 +459,11 @@ def run_cli(args):
                           "error": f"cannot reach bridge on :{HTTP_PORT} - is it running? ({exc})"}))
         return 1
 
+    if body.get("screenshot_saved"):
+        brain_path = sync_brain_artifact(body.get("screenshot_saved"), body.get("tab"))
+        if brain_path:
+            body["brain_sync_path"] = brain_path
+
     body.pop("elements", None) if args.brief else None
     print(json.dumps(body, indent=2))
     return 0 if body.get("status") == "ok" else 1
@@ -317,24 +472,33 @@ def run_cli(args):
 def main():
     global TOKEN, ALLOW_EVAL
 
-    parser = argparse.ArgumentParser(description="Kiro Browser Bridge")
+    parser = argparse.ArgumentParser(description="Kiro-AG-Browser Bridge")
     parser.add_argument("--server", action="store_true", help="run the bridge server")
     parser.add_argument("--allow-eval", action="store_true",
                         help="permit arbitrary JS execution in page context")
     parser.add_argument("--print-token", action="store_true", help="print the token and exit")
+    parser.add_argument("--client", "--agent-name", dest="agent_name",
+                        default=os.environ.get("BRIDGE_CLIENT_NAME", "Kiro"),
+                        help="agent client identifier (e.g. AG or Kiro)")
     parser.add_argument("--action", default="get_state",
                         choices=["get_state", "navigate", "click", "type", "form_input",
-                                 "scroll", "switch_tab", "focus_tab", "eval", "key"])
+                                 "scroll", "switch_tab", "focus_tab", "eval", "key",
+                                 "select_option", "read_content", "get_errors", "new_tab",
+                                 "close_tab", "reload_extension"])
     parser.add_argument("--url", default="")
     parser.add_argument("--target", default="")
+    parser.add_argument("--value", default="", help="option value or text for select_option")
     parser.add_argument("--x", type=int)
     parser.add_argument("--y", type=int)
     parser.add_argument("--text", default="")
     parser.add_argument("--key")
+    parser.add_argument("--modifiers", help="comma-separated key modifiers (Control, Shift, Alt, Meta)")
     parser.add_argument("--code")
     parser.add_argument("--enter", action="store_true")
     parser.add_argument("--direction", default="down", choices=["up", "down"])
     parser.add_argument("--amount", type=int, default=500)
+    parser.add_argument("--max-length", type=int, default=25000)
+    parser.add_argument("--no-badges", action="store_true", help="disable visual Set-of-Marks badge overlay")
     parser.add_argument("--tab-id", type=int, dest="tab_id")
     parser.add_argument("--on-dialog", dest="on_dialog", choices=["accept", "dismiss"],
                         help="how to answer a JS dialog raised by this action")

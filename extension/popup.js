@@ -7,17 +7,24 @@ const warn       = document.getElementById('warn');
 const agentState = document.getElementById('agentState');
 const steal      = document.getElementById('stealFocus');
 
-function describeAgentTab(tabId) {
-  if (!tabId) {
-    agentState.textContent = 'no tab yet - created on first command';
+function describeAgentTabs(map) {
+  const entries = Object.entries(map || {}).filter(([, id]) => !!id);
+  if (!entries.length) {
+    agentState.textContent = 'none yet - created on first command';
     return;
   }
-  chrome.tabs.get(tabId, (tab) => {
-    if (chrome.runtime.lastError || !tab) {
-      agentState.textContent = 'no tab yet - created on first command';
-      return;
-    }
-    agentState.textContent = `id=${tab.id} · ${(tab.title || tab.url || '').slice(0, 46)}`;
+
+  agentState.textContent = 'loading…';
+  Promise.all(entries.map(([agent, id]) => new Promise((resolve) => {
+    chrome.tabs.get(id, (tab) => {
+      if (chrome.runtime.lastError || !tab) return resolve(null);
+      resolve(`${agent}: ${(tab.title || tab.url || '').slice(0, 38)}`);
+    });
+  }))).then((rows) => {
+    const found = rows.filter(Boolean);
+    agentState.textContent = found.length
+      ? found.join('\n')
+      : 'none yet - created on first command';
   });
 }
 
@@ -30,7 +37,7 @@ function refresh() {
     }
 
     steal.checked = !!res.stealFocus;
-    describeAgentTab(res.agentTabId);
+    describeAgentTabs(res.agentTabs);
 
     if (res.connected && res.authed) {
       dot.classList.add('on');

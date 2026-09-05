@@ -12,15 +12,20 @@ asking him to click things.
 
 | Tool | Does |
 | --- | --- |
-| `browser_get_state` | URL, title, numbered interactive elements, screenshot |
+| `browser_get_state` | URL, title, numbered interactive elements with offscreen visual badges, screenshot |
 | `browser_navigate` | Go to a URL |
 | `browser_click` | Click by element number, or raw x/y |
 | `browser_type` | Type into whatever currently has focus |
 | `browser_fill` | Set a field by element number or CSS selector (React-safe) |
-| `browser_key` | Press a named key |
+| `browser_select_option` | Select an option in a dropdown or combobox by element number or value |
+| `browser_read_content` | Extract clean, readable Markdown of page content (strips ads/scripts) |
+| `browser_get_errors` | Return recent JavaScript console errors and failed network requests (HTTP >= 400) |
+| `browser_key` | Press a named key (supports modifiers: Control, Shift, Alt, Meta) |
 | `browser_scroll` | Scroll up or down |
-| `browser_list_tabs` | List open tabs with ids; `[agent]` marks the Kiro tab |
+| `browser_list_tabs` | List open tabs with ids; `[agent]` marks the agent tab |
 | `browser_use_tab` | Adopt an existing tab as the working tab |
+| `browser_new_tab` | Open a new tab in the agent tab group |
+| `browser_close_tab` | Close the agent tab |
 | `browser_focus_tab` | Bring the working tab to the front (interrupts him) |
 | `browser_eval` | Run JS - only works if the bridge was started with `--allow-eval` |
 

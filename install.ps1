@@ -84,6 +84,9 @@ Step '2/8  Dependencies'
 $prev = $ErrorActionPreference
 $ErrorActionPreference = 'Continue'
 & $python -m pip install --quiet --upgrade websockets 2>&1 | Out-Null
+# Pillow draws the numbered badges onto screenshots. Optional - the bridge runs
+# without it and says so in the response - but the agent loses set-of-marks.
+& $python -m pip install --quiet "Pillow>=10.0.0" 2>&1 | Out-Null
 $ErrorActionPreference = $prev
 
 $wsVersion = & $python -c "import websockets; print(websockets.__version__)" 2>$null
@@ -93,6 +96,14 @@ if (-not $wsVersion) {
     throw 'Missing dependency.'
 }
 Ok "websockets $wsVersion"
+
+$pilVersion = & $python -c "import PIL; print(PIL.__version__)" 2>$null
+if ($pilVersion) {
+    Ok "Pillow $pilVersion (screenshot badges enabled)"
+} else {
+    Info 'Pillow not installed - screenshots will have no numbered badges'
+    Info "Optional:  $python -m pip install Pillow"
+}
 
 # ---------------------------------------------------------------------------
 Step '3/8  Shared secret'
@@ -109,7 +120,7 @@ Ok 'token written to .bridge-token'
 Ok 'embedded in extension\token.json - the extension self-pairs'
 
 # ---------------------------------------------------------------------------
-Step '4/8  Kiro MCP registration'
+Step '4/9  Kiro MCP registration'
 
 $mcpDir  = Join-Path $KiroHome 'settings'
 $mcpPath = Join-Path $mcpDir 'mcp.json'
@@ -138,7 +149,7 @@ $cfg | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $mcpPath -Encoding UT
 Ok "registered 'browser-bridge' in $mcpPath"
 
 # ---------------------------------------------------------------------------
-Step '5/8  Kiro skill'
+Step '5/9  Kiro skill'
 
 $skillSrc = Join-Path $Root 'kiro\skills\browser-control\SKILL.md'
 $skillDir = Join-Path $KiroHome 'skills\browser-control'
@@ -153,7 +164,43 @@ $stale = Join-Path $KiroHome 'steering\browser-control.md'
 if (Test-Path $stale) { Remove-Item $stale -Force; Info 'removed stale steering\browser-control.md' }
 
 # ---------------------------------------------------------------------------
-Step '6/8  Logon task'
+Step '6/9  Antigravity (AG) MCP & Skill'
+
+$GeminiHome = Join-Path $env:USERPROFILE '.gemini'
+$agConfigDir = Join-Path $GeminiHome 'config'
+$agMcpPath   = Join-Path $agConfigDir 'mcp_config.json'
+New-Item -ItemType Directory -Force -Path $agConfigDir | Out-Null
+
+if (Test-Path $agMcpPath) {
+    Copy-Item $agMcpPath "$agMcpPath.bak" -Force
+    try   { $agCfg = Get-Content -Raw -LiteralPath $agMcpPath | ConvertFrom-Json }
+    catch { $agCfg = [pscustomobject]@{} }
+} else {
+    $agCfg = [pscustomobject]@{}
+}
+if (-not $agCfg.PSObject.Properties.Name.Contains('mcpServers')) {
+    $agCfg | Add-Member -NotePropertyName mcpServers -NotePropertyValue ([pscustomobject]@{}) -Force
+}
+$agEntry = [pscustomobject]@{
+    command = $python
+    args    = @((Join-Path $Root 'scripts\mcp_server.py'), '--client', 'AG')
+    env     = [pscustomobject]@{ BRIDGE_CLIENT_NAME = 'AG' }
+}
+$agCfg.mcpServers | Add-Member -NotePropertyName 'browser-bridge' -NotePropertyValue $agEntry -Force
+$agCfg | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $agMcpPath -Encoding UTF8
+Ok "registered 'browser-bridge' in $agMcpPath"
+
+$agSkillSrc = Join-Path $Root 'antigravity\skills\browser-bridge'
+$agSkillDir = Join-Path $agConfigDir 'skills\browser-bridge'
+New-Item -ItemType Directory -Force -Path $agSkillDir | Out-Null
+Copy-Item (Join-Path $agSkillSrc 'SKILL.md') (Join-Path $agSkillDir 'SKILL.md') -Force
+$agScriptsDir = Join-Path $agSkillDir 'scripts'
+New-Item -ItemType Directory -Force -Path $agScriptsDir | Out-Null
+Copy-Item (Join-Path $agSkillSrc 'scripts\bridge_server.py') (Join-Path $agScriptsDir 'bridge_server.py') -Force
+Ok "installed Antigravity skill to $agSkillDir"
+
+# ---------------------------------------------------------------------------
+Step '7/9  Logon task'
 
 if ($NoLogonTask) {
     Info 'skipped (-NoLogonTask). Start the bridge yourself when needed.'
@@ -162,7 +209,10 @@ else {
     $evalFlag = if ($AllowEval) { ' --allow-eval' } else { '' }
     $argLine  = '"{0}" --server{1}' -f (Join-Path $Root 'scripts\bridge_server.py'), $evalFlag
 
-    $action = New-ScheduledTaskAction -Execute $python -Argument $argLine -WorkingDirectory $Root
+    $pythonw = $python -replace 'python\.exe$', 'pythonw.exe'
+    if (-not (Test-Path $pythonw)) { $pythonw = $python }
+
+    $action = New-ScheduledTaskAction -Execute $pythonw -Argument $argLine -WorkingDirectory $Root
     $trigger = New-ScheduledTaskTrigger -AtLogOn -User "$env:USERDOMAIN\$env:USERNAME"
     $principal = New-ScheduledTaskPrincipal -UserId "$env:USERDOMAIN\$env:USERNAME" `
                     -LogonType Interactive -RunLevel Limited
@@ -173,12 +223,12 @@ else {
     Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue
     Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger `
         -Principal $principal -Settings $settings `
-        -Description 'Starts the Kiro browser bridge (WebSocket 8766 / HTTP 8765) at logon.' | Out-Null
-    Ok "scheduled task '$TaskName' registered (at logon)"
+        -Description 'Starts the Kiro-AG browser bridge silently in background at logon.' | Out-Null
+    Ok "scheduled task '$TaskName' registered (silent at logon)"
 }
 
 # ---------------------------------------------------------------------------
-Step '7/8  Start the bridge'
+Step '8/9  Start the bridge'
 
 $running = $false
 foreach ($p in 8765, 8766) {
@@ -195,10 +245,12 @@ if ($running) {
 }
 
 if ($NoLogonTask) {
+    $pythonw = $python -replace 'python\.exe$', 'pythonw.exe'
+    if (-not (Test-Path $pythonw)) { $pythonw = $python }
     $evalFlag = if ($AllowEval) { '--allow-eval' } else { '' }
-    Start-Process -FilePath $python `
+    Start-Process -FilePath $pythonw `
         -ArgumentList @("`"$(Join-Path $Root 'scripts\bridge_server.py')`"", '--server', $evalFlag) `
-        -WorkingDirectory $Root
+        -WorkingDirectory $Root -WindowStyle Hidden
 } else {
     Start-ScheduledTask -TaskName $TaskName
 }
@@ -219,7 +271,7 @@ if ($AllowEval) { Warn 'browser_eval is ENABLED - arbitrary JS in a logged-in br
 else            { Info 'browser_eval disabled (default)' }
 
 # ---------------------------------------------------------------------------
-Step '8/8  Security tests'
+Step '9/9  Security tests'
 
 if ($SkipTests) {
     Info 'skipped (-SkipTests)'
@@ -256,10 +308,10 @@ Write-Host @"
     3.  Click          Load unpacked
     4.  Select         $extPath$clip
 
-  Then start a NEW Kiro chat session and the browser_* tools will work.
+  Then start a NEW chat session in Kiro or Antigravity!
   The extension reads token.json and pairs itself - nothing to paste.
 
-  Verify:   ask Kiro "what tabs do I have open?"
+  Verify:   ask Kiro or AG "what tabs do I have open?"
 
 "@ -ForegroundColor Gray
 

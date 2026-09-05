@@ -59,6 +59,8 @@ function attachDebugger(tabId) {
         enable('Page.enable'),
         enable('DOM.enable'),
         enable('Runtime.enable'),
+        enable('Log.enable'),
+        enable('Network.enable'),
         // The agent tab is deliberately never the active one, and an unfocused
         // renderer suppresses :focus styles, autocomplete popups and some
         // input handlers. Focus emulation makes the page behave as if the user
@@ -102,9 +104,43 @@ chrome.debugger.onDetach.addListener((source) => {
 // Screencast frames arrive as CDP events rather than command results, so they
 // need a listener and an explicit ack - Chrome stops sending frames otherwise.
 const screencastWaiters = new Map();
+const tabErrors = new Map(); // tabId -> Array of error objects (max 30)
+
+function recordError(tabId, err) {
+  const list = tabErrors.get(tabId) || [];
+  list.push(err);
+  if (list.length > 30) list.shift();
+  tabErrors.set(tabId, list);
+}
 
 chrome.debugger.onEvent.addListener((source, method, params) => {
   if (!source.tabId) return;
+
+  if (method === 'Log.entryAdded' && params && params.entry) {
+    if (params.entry.level === 'error' || params.entry.level === 'warning') {
+      recordError(source.tabId, {
+        type: 'console',
+        level: params.entry.level,
+        text: String(params.entry.text || '').slice(0, 300),
+        url: params.entry.url || '',
+        timestamp: Date.now()
+      });
+    }
+    return;
+  }
+
+  if (method === 'Network.responseReceived' && params && params.response) {
+    if (params.response.status >= 400) {
+      recordError(source.tabId, {
+        type: 'network',
+        status: params.response.status,
+        statusText: params.response.statusText,
+        url: String(params.response.url || '').slice(0, 250),
+        timestamp: Date.now()
+      });
+    }
+    return;
+  }
 
   // Handled even when no command is in flight - a page's own setTimeout(alert)
   // would otherwise wedge the tab until it is closed.
@@ -198,7 +234,8 @@ chrome.tabs.onRemoved.addListener((tabId) => {
   dialogPolicy.delete(tabId);
   dialogPromptText.delete(tabId);
   dialogLog.delete(tabId);
-  if (tabId === agentTabId) forgetAgentTab();
+  tabErrors.delete(tabId);
+  forgetAgentTab(tabId);
 });
 
 // ---------------------------------------------------------------------------
@@ -214,12 +251,30 @@ chrome.tabs.onRemoved.addListener((tabId) => {
 // ---------------------------------------------------------------------------
 
 const INTERNAL_PREFIXES = ['chrome://', 'edge://', 'about:', 'chrome-extension://', 'devtools://'];
-const AGENT_GROUP_TITLE = 'Kiro';
-const AGENT_GROUP_COLOR = 'cyan';
 
-let agentTabId = null;
+// Each agent gets its own tab, its own group and its own colour. Sharing one
+// tab between agents does not work: two agents navigating the same tab overwrite
+// each other's page, and each then reads a screenshot of the other's work.
+// Relabelling a single shared group is cosmetic, not isolation.
+const AGENT_STYLES = {
+  Kiro: { title: 'Kiro', color: 'cyan' },
+  AG:   { title: 'AG',   color: 'blue' }
+};
+const DEFAULT_AGENT = 'Kiro';
 
-// Where to hand focus back to if anything ever has to foreground the agent tab.
+function normaliseAgent(agentName) {
+  if (/^(ag|antigravity)$/i.test(String(agentName || '').trim())) return 'AG';
+  return DEFAULT_AGENT;
+}
+
+function getAgentStyle(agentName) {
+  return AGENT_STYLES[normaliseAgent(agentName)];
+}
+
+// agent key -> tabId
+let agentTabs = Object.create(null);
+
+// Where to hand focus back to if anything ever has to foreground an agent tab.
 let lastUserTabId = null;
 
 // Opt-in via the popup. Off by default: the whole point is not to take over.
@@ -229,10 +284,14 @@ chrome.storage.local.get('bridgeStealFocus').then(({ bridgeStealFocus }) => {
   stealFocus = !!bridgeStealFocus;
 }).catch(() => {});
 
-// Rehydrate on every worker start, so the popup and getAllTabs know which tab
-// is the agent's before any command has run.
-chrome.storage.session.get('agentTabId').then(({ agentTabId: stored }) => {
-  if (stored && !agentTabId) agentTabId = stored;
+// Rehydrate on every worker start, so the popup and getAllTabs know which tabs
+// belong to which agent before any command has run.
+chrome.storage.session.get('agentTabs').then(({ agentTabs: stored }) => {
+  if (stored && typeof stored === 'object') {
+    for (const [agent, tabId] of Object.entries(stored)) {
+      if (!agentTabs[agent]) agentTabs[agent] = tabId;
+    }
+  }
 }).catch(() => {});
 
 chrome.storage.onChanged.addListener((changes, area) => {
@@ -263,43 +322,107 @@ async function getTabOrNull(tabId) {
  * Getting this wrong is not cosmetic. Losing the id used to fall through to
  * "any automatable tab", which silently hijacked whatever the user had open.
  */
-async function rememberAgentTab(tabId) {
-  agentTabId = tabId;
+async function persistAgentTabs() {
   try {
-    await chrome.storage.session.set({ agentTabId: tabId });
+    await chrome.storage.session.set({ agentTabs: { ...agentTabs } });
   } catch (e) { /* session storage unavailable */ }
 }
 
-async function forgetAgentTab() {
-  agentTabId = null;
-  try {
-    await chrome.storage.session.remove('agentTabId');
-  } catch (e) { /* nothing to do */ }
+async function rememberAgentTab(agent, tabId) {
+  agentTabs[normaliseAgent(agent)] = tabId;
+  await persistAgentTabs();
 }
 
-async function recallAgentTab() {
+/** Called when a tab closes, so it is keyed by tab rather than by agent. */
+async function forgetAgentTab(tabId) {
+  let changed = false;
+  for (const [agent, id] of Object.entries(agentTabs)) {
+    if (id === tabId) {
+      delete agentTabs[agent];
+      changed = true;
+    }
+  }
+  if (changed) await persistAgentTabs();
+}
+
+function agentOwning(tabId) {
+  for (const [agent, id] of Object.entries(agentTabs)) {
+    if (id === tabId) return agent;
+  }
+  return null;
+}
+
+async function recallAgentTab(agent) {
   try {
-    const { agentTabId: stored } = await chrome.storage.session.get('agentTabId');
-    if (stored) {
-      const tab = await getTabOrNull(stored);
+    const { agentTabs: stored } = await chrome.storage.session.get('agentTabs');
+    const tabId = stored && stored[normaliseAgent(agent)];
+    if (tabId) {
+      const tab = await getTabOrNull(tabId);
       if (tab) return tab;
     }
   } catch (e) { /* fall through to the group lookup */ }
   return null;
 }
 
-async function findGroupedAgentTab() {
+/**
+ * Only this agent's own group is considered. Matching any agent's group would
+ * hand one agent the other's tab after a service-worker restart, which is the
+ * collision this split exists to prevent.
+ */
+async function findGroupedAgentTab(agent) {
   if (!chrome.tabGroups) return null;
+  const { title } = getAgentStyle(agent);
+  const claimed = new Set(Object.values(agentTabs));
   try {
-    const groups = await chrome.tabGroups.query({ title: AGENT_GROUP_TITLE });
+    const groups = await chrome.tabGroups.query({ title });
     for (const group of groups) {
       const tabs = await chrome.tabs.query({ groupId: group.id });
-      if (tabs.length) {
-        return tabs.find((t) => isAutomatable(t.url)) || tabs[0];
+      const free = tabs.filter((t) => !claimed.has(t.id));
+      if (free.length) {
+        return free.find((t) => isAutomatable(t.url)) || free[0];
       }
     }
   } catch (e) { /* tabGroups unavailable */ }
   return null;
+}
+
+async function updateAgentGroupStyle(tabId, requestedAgent = DEFAULT_AGENT) {
+  if (!chrome.tabGroups || !tabId) return;
+  try {
+    const tab = await getTabOrNull(tabId);
+    if (!tab) return;
+
+    const style = getAgentStyle(requestedAgent);
+    const ungrouped = chrome.tabGroups.TAB_GROUP_ID_NONE;
+    let groupId = tab.groupId;
+    const isGrouped = groupId && groupId !== ungrouped && groupId !== -1;
+
+    if (isGrouped) {
+      // If this tab is sitting in the other agent's group, move it into its own
+      // rather than renaming a group that is not ours.
+      let current = null;
+      try { current = await chrome.tabGroups.get(groupId); } catch (e) { /* gone */ }
+      const belongsToAnother = current && current.title && current.title !== style.title
+        && Object.values(AGENT_STYLES).some((s) => s.title === current.title);
+
+      if (belongsToAnother) {
+        await chrome.tabs.ungroup(tab.id);
+        groupId = await chrome.tabs.group({ tabIds: tab.id });
+      } else if (current && current.title === style.title && current.color === style.color) {
+        return;   // already correct, do not churn the tab strip
+      }
+    } else {
+      groupId = await chrome.tabs.group({ tabIds: tab.id });
+    }
+
+    await chrome.tabGroups.update(groupId, {
+      title: style.title,
+      color: style.color,
+      collapsed: false
+    });
+  } catch (e) {
+    console.warn('[bridge] could not update agent tab group style:', e && e.message);
+  }
 }
 
 async function pickHostWindowId() {
@@ -315,20 +438,27 @@ async function pickHostWindowId() {
   return null;
 }
 
-async function ensureAgentTab() {
-  let tab = await getTabOrNull(agentTabId);
-  if (tab) return { tab, source: 'memory' };
+async function ensureAgentTab(agentName = DEFAULT_AGENT) {
+  const agent = normaliseAgent(agentName);
 
-  tab = await recallAgentTab();
+  let tab = await getTabOrNull(agentTabs[agent]);
   if (tab) {
-    await rememberAgentTab(tab.id);
-    return { tab, source: 'session' };
+    await updateAgentGroupStyle(tab.id, agent);
+    return { tab, source: 'memory', agent };
   }
 
-  tab = await findGroupedAgentTab();
+  tab = await recallAgentTab(agent);
   if (tab) {
-    await rememberAgentTab(tab.id);
-    return { tab, source: 'group' };
+    await rememberAgentTab(agent, tab.id);
+    await updateAgentGroupStyle(tab.id, agent);
+    return { tab, source: 'session', agent };
+  }
+
+  tab = await findGroupedAgentTab(agent);
+  if (tab) {
+    await rememberAgentTab(agent, tab.id);
+    await updateAgentGroupStyle(tab.id, agent);
+    return { tab, source: 'group', agent };
   }
 
   const windowId = await pickHostWindowId();
@@ -337,34 +467,28 @@ async function ensureAgentTab() {
     active: false,               // never pull focus off the user's tab
     ...(windowId ? { windowId } : {})
   });
-  await rememberAgentTab(created.id);
+  await rememberAgentTab(agent, created.id);
+  await updateAgentGroupStyle(created.id, agent);
 
-  try {
-    const groupId = await chrome.tabs.group({ tabIds: created.id });
-    await chrome.tabGroups.update(groupId, {
-      title: AGENT_GROUP_TITLE,
-      color: AGENT_GROUP_COLOR,
-      collapsed: false
-    });
-  } catch (e) {
-    // Grouping is cosmetic, but without it the label-based recovery above stops
-    // working, so it is worth surfacing.
-    console.warn('[bridge] could not group agent tab:', e && e.message);
-  }
+  return { tab: (await getTabOrNull(created.id)) || created, source: 'created', agent };
+}
 
-  return { tab: (await getTabOrNull(created.id)) || created, source: 'created' };
+function agentFor(cmd) {
+  return normaliseAgent(cmd?.agent_name || cmd?.client);
 }
 
 async function getTargetTab(cmd) {
+  const agent = agentFor(cmd);
+
   if (cmd && cmd.tab_id) {
     const found = await getTabOrNull(cmd.tab_id);
-    if (found) return { tab: found, source: 'tab_id' };
-    return { tab: null, source: 'tab_id_missing' };
+    if (found) return { tab: found, source: 'tab_id', agent };
+    return { tab: null, source: 'tab_id_missing', agent };
   }
 
   // Deliberately no "any tab will do" fallback. Driving a tab the user is
   // using, without being asked to, is worse than returning an error.
-  return ensureAgentTab();
+  return ensureAgentTab(agent);
 }
 
 async function getAllTabs() {
@@ -374,7 +498,8 @@ async function getAllTabs() {
     title: t.title,
     url: t.url,
     active: t.active,
-    agent: t.id === agentTabId
+    agent: agentOwning(t.id) !== null,
+    agent_name: agentOwning(t.id) || undefined
   }));
 }
 
@@ -535,12 +660,46 @@ const KEY_MAP = {
   End:        { windowsVirtualKeyCode: 35, code: 'End',        key: 'End' }
 };
 
-async function sendKey(tabId, key) {
+const MODIFIER_MASKS = {
+  alt: 1,
+  control: 2,
+  ctrl: 2,
+  meta: 4,
+  command: 4,
+  cmd: 4,
+  shift: 8
+};
+
+function parseModifiers(mods) {
+  if (!mods) return 0;
+  if (typeof mods === 'string') mods = mods.split(/[+,|]/).map((s) => s.trim());
+  let mask = 0;
+  for (const m of mods) {
+    const key = String(m).toLowerCase();
+    if (MODIFIER_MASKS[key]) mask |= MODIFIER_MASKS[key];
+  }
+  return mask;
+}
+
+async function sendKey(tabId, key, modifiers = []) {
   await attachDebugger(tabId);
-  const def = KEY_MAP[key];
-  if (!def) throw new Error(`Unsupported key: ${key}`);
-  await sendCDP(tabId, 'Input.dispatchKeyEvent', { type: 'keyDown', ...def });
-  await sendCDP(tabId, 'Input.dispatchKeyEvent', { type: 'keyUp', ...def });
+  const modMask = parseModifiers(modifiers);
+  let def = KEY_MAP[key];
+  if (!def) {
+    if (key && key.length === 1) {
+      const char = key.toUpperCase();
+      const code = /^[A-Z]$/.test(char) ? ('Key' + char) : (/^[0-9]$/.test(char) ? ('Digit' + char) : 'Unidentified');
+      const vkey = char.charCodeAt(0);
+      def = { windowsVirtualKeyCode: vkey, code, key, text: key, unmodifiedText: key };
+    } else {
+      throw new Error(`Unsupported key: ${key}`);
+    }
+  }
+  await sendCDP(tabId, 'Input.dispatchKeyEvent', { type: 'rawKeyDown', ...def, modifiers: modMask });
+  if (def.text && !modMask) {
+    await sendCDP(tabId, 'Input.dispatchKeyEvent', { type: 'char', text: def.text, unmodifiedText: def.unmodifiedText || def.text, modifiers: modMask });
+  }
+  await sendCDP(tabId, 'Input.dispatchKeyEvent', { type: 'keyUp', ...def, modifiers: modMask });
 }
 
 async function typeText(tabId, text, pressEnter) {
@@ -625,7 +784,11 @@ const ANNOTATE_JS = `
         text: label,
         href: (el.getAttribute('href') || '').slice(0, 200),
         x: cx,
-        y: cy
+        y: cy,
+        left: Math.round(left),
+        top: Math.round(top),
+        width: Math.round(r.width),
+        height: Math.round(r.height)
       });
       i++;
     }
@@ -640,6 +803,89 @@ async function annotate(tabId) {
   } catch (e) {
     return [];
   }
+}
+
+async function readContent(tabId, maxLength = 25000) {
+  const js = `
+  (() => {
+    const clone = document.body.cloneNode(true);
+    clone.querySelectorAll('script, style, noscript, svg, canvas, iframe, [aria-hidden="true"]').forEach(el => el.remove());
+
+    function nodeToMd(node) {
+      if (node.nodeType === Node.TEXT_NODE) {
+        return node.textContent.replace(/\\s+/g, ' ');
+      }
+      if (node.nodeType !== Node.ELEMENT_NODE) return '';
+
+      const tag = node.tagName.toLowerCase();
+      let text = '';
+      for (const child of node.childNodes) {
+        text += nodeToMd(child);
+      }
+      text = text.trim();
+      if (!text) return '';
+
+      if (/^h[1-6]$/.test(tag)) {
+        const level = parseInt(tag[1], 10);
+        return '\\n\\n' + '#'.repeat(level) + ' ' + text + '\\n\\n';
+      }
+      if (tag === 'p') return '\\n\\n' + text + '\\n\\n';
+      if (tag === 'li') return '\\n* ' + text;
+      if (tag === 'blockquote') return '\\n> ' + text + '\\n';
+      if (tag === 'pre' || tag === 'code') return '\\n\`\`\`\\n' + node.innerText + '\\n\`\`\`\\n';
+      if (tag === 'a') {
+        const href = node.getAttribute('href');
+        return href ? '[' + text + '](' + href + ')' : text;
+      }
+      if (tag === 'tr') return text + ' |\\n';
+      if (tag === 'th' || tag === 'td') return '| ' + text + ' ';
+      return text;
+    }
+
+    const md = nodeToMd(clone).replace(/\\n{3,}/g, '\\n\\n').trim();
+    return {
+      title: document.title,
+      url: window.location.href,
+      content: md.slice(0, ${JSON.stringify(maxLength)})
+    };
+  })()
+  `;
+  return await evaluate(tabId, js);
+}
+
+async function selectOption(tabId, target, valueOrText) {
+  const js = `
+  (() => {
+    const t = ${JSON.stringify(String(target))};
+    const needle = ${JSON.stringify(String(valueOrText).toLowerCase())};
+    let el = null;
+    if (/^\\d+$/.test(t)) {
+      const item = window.__agent_elements && window.__agent_elements[parseInt(t, 10)];
+      el = item && item.el;
+    }
+    if (!el) el = document.querySelector(t);
+    if (!el) return { error: 'element not found: ' + t };
+
+    if (el.tagName.toLowerCase() === 'select') {
+      let matched = null;
+      for (const opt of el.options) {
+        if (opt.value.toLowerCase() === needle || opt.text.trim().toLowerCase().includes(needle)) {
+          matched = opt;
+          break;
+        }
+      }
+      if (!matched) return { error: 'option not found in select: ' + needle };
+      el.value = matched.value;
+      el.dispatchEvent(new Event('input', { bubbles: true }));
+      el.dispatchEvent(new Event('change', { bubbles: true }));
+      return { ok: true, selected: matched.text };
+    }
+
+    el.click();
+    return { ok: true, clicked: true, note: 'opened dropdown - select matching badge next' };
+  })()
+  `;
+  return await evaluate(tabId, js);
 }
 
 /**
@@ -685,6 +931,8 @@ async function formInput(tabId, target, value) {
 
 async function handleCommand(cmd) {
   const action = cmd.action || 'get_state';
+
+  const activeAgent = agentFor(cmd);
 
   let tab = null;
   let tabSource = 'unknown';
@@ -782,9 +1030,90 @@ async function handleCommand(cmd) {
         break;
 
       case 'key':
-        await sendKey(tabId, cmd.key || 'Enter');
+        await sendKey(tabId, cmd.key || 'Enter', cmd.modifiers || []);
         await new Promise((r) => setTimeout(r, 350));
         break;
+
+      case 'select_option': {
+        if (!cmd.target) throw new Error('select_option requires target');
+        const r = await selectOption(tabId, cmd.target, cmd.value || cmd.text || '');
+        if (r && r.error) throw new Error(r.error);
+        await new Promise((r2) => setTimeout(r2, 400));
+        break;
+      }
+
+      case 'read_content': {
+        const data = await readContent(tabId, cmd.max_length || 25000);
+        return {
+          status: 'ok',
+          content: data.content,
+          title: data.title,
+          url: data.url,
+          tab: {
+            id: tabId, title: tab.title, url: tab.url,
+            agent: agentOwning(tabId) !== null,
+            agent_name: agentOwning(tabId) || activeAgent
+          }
+        };
+      }
+
+      case 'get_errors': {
+        return {
+          status: 'ok',
+          errors: tabErrors.get(tabId) || [],
+          tab: {
+            id: tabId, title: tab.title, url: tab.url,
+            agent: agentOwning(tabId) !== null,
+            agent_name: agentOwning(tabId) || activeAgent
+          }
+        };
+      }
+
+      case 'new_tab': {
+        const windowId = await pickHostWindowId();
+        let url = cmd.url || 'about:blank';
+        if (url !== 'about:blank' && !/^[a-z][a-z0-9+.-]*:/i.test(url)) url = 'https://' + url;
+        const created = await chrome.tabs.create({
+          url,
+          active: false,
+          ...(windowId ? { windowId } : {})
+        });
+        // The new tab becomes this agent's working tab, and only this agent's.
+        await rememberAgentTab(activeAgent, created.id);
+        await updateAgentGroupStyle(created.id, activeAgent);
+        if (url !== 'about:blank') {
+          await waitForLoad(created.id);
+        }
+        const current = await chrome.tabs.get(created.id);
+        return {
+          status: 'ok',
+          tab: {
+            id: current.id,
+            title: current.title,
+            url: current.url,
+            agent: true,
+            agent_name: activeAgent
+          },
+          tabs: await getAllTabs()
+        };
+      }
+
+      case 'close_tab': {
+        const targetId = cmd.tab_id || agentTabs[activeAgent];
+
+        // Refuse to close a tab belonging to the other agent, or one the user
+        // owns. Only an explicit tab_id can target outside this agent's tab.
+        const owner = targetId ? agentOwning(targetId) : null;
+        if (targetId && !cmd.tab_id && owner !== activeAgent) {
+          return { status: 'error', error: 'no tab of your own to close',
+                   tabs: await getAllTabs() };
+        }
+        if (targetId) {
+          await forgetAgentTab(targetId);
+          try { await chrome.tabs.remove(targetId); } catch (e) {}
+        }
+        return { status: 'ok', tabs: await getAllTabs() };
+      }
 
       case 'scroll': {
         const dy = cmd.direction === 'up' ? -(cmd.amount || 500) : (cmd.amount || 500);
@@ -796,7 +1125,7 @@ async function handleCommand(cmd) {
       case 'switch_tab':
         // Explicitly adopting a tab makes it the agent's working tab from now
         // on, so follow-up commands without a tab_id land on the same page.
-        if (cmd.tab_id) await rememberAgentTab(tabId);
+        if (cmd.tab_id) await rememberAgentTab(activeAgent, tabId);
         break;
 
       case 'focus_tab':
@@ -815,6 +1144,10 @@ async function handleCommand(cmd) {
         const value = await evaluate(tabId, cmd.code);
         return { status: 'ok', result: value, tab: { id: tabId, url: tab.url } };
       }
+
+      case 'reload_extension':
+        setTimeout(() => chrome.runtime.reload(), 50);
+        return { status: 'ok', result: 'extension reloading' };
 
       default:
         throw new Error(`unknown action: ${action}`);
@@ -838,13 +1171,16 @@ async function handleCommand(cmd) {
       screenshotError = String((e && e.message) || e);
     }
 
+
+
     return {
       status: 'ok',
       tab: {
         id: current.id,
         title: current.title,
         url: current.url,
-        agent: current.id === agentTabId,
+        agent: agentOwning(current.id) !== null,
+        agent_name: agentOwning(current.id) || activeAgent,
         active: current.active,
         source: tabSource
       },
@@ -852,6 +1188,7 @@ async function handleCommand(cmd) {
       interactive_elements_count: elements.length,
       elements,
       ...(dialogLog.get(tabId)?.length ? { dialogs: dialogLog.get(tabId) } : {}),
+      ...(tabErrors.get(tabId)?.length ? { recent_errors: tabErrors.get(tabId).slice(-5) } : {}),
       screenshot,
       ...(screenshotMode ? { screenshot_mode: screenshotMode } : {}),
       ...(backgroundCaptureError ? { background_capture_error: backgroundCaptureError } : {}),
@@ -1050,7 +1387,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, reply) => {
       connected: !!ws && ws.readyState === WebSocket.OPEN,
       authed,
       attached: attachedTabs.size,
-      agentTabId,
+      agentTabs: { ...agentTabs },
       stealFocus
     });
     return true;
@@ -1066,11 +1403,13 @@ chrome.runtime.onMessage.addListener((msg, _sender, reply) => {
     return true;
   }
   if (msg && msg.type === 'close_agent_tab') {
-    const id = agentTabId;
-    forgetAgentTab().then(() => {
-      if (!id) return reply({ ok: true });
-      chrome.tabs.remove(id).then(() => reply({ ok: true })).catch(() => reply({ ok: true }));
-    });
+    // Closes every agent tab, since the popup is the user's control not an
+    // agent's, and they should not have to close them one at a time.
+    const ids = Object.values(agentTabs).filter(Boolean);
+    Promise.all(ids.map((id) => forgetAgentTab(id)))
+      .then(() => Promise.all(ids.map((id) => chrome.tabs.remove(id).catch(() => {}))))
+      .then(() => reply({ ok: true }))
+      .catch(() => reply({ ok: true }));
     return true;
   }
   if (msg && msg.type === 'reconnect') {
@@ -1085,7 +1424,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, reply) => {
 });
 
 chrome.tabs.onActivated.addListener((info) => {
-  if (info && info.tabId && info.tabId !== agentTabId) lastUserTabId = info.tabId;
+  if (info && info.tabId && agentOwning(info.tabId) === null) lastUserTabId = info.tabId;
   ensureConnected();
 });
 chrome.tabs.onUpdated.addListener(ensureConnected);

@@ -196,8 +196,16 @@ New-Item -ItemType Directory -Force -Path $agSkillDir | Out-Null
 Copy-Item (Join-Path $agSkillSrc 'SKILL.md') (Join-Path $agSkillDir 'SKILL.md') -Force
 $agScriptsDir = Join-Path $agSkillDir 'scripts'
 New-Item -ItemType Directory -Force -Path $agScriptsDir | Out-Null
-Copy-Item (Join-Path $agSkillSrc 'scripts\bridge_server.py') (Join-Path $agScriptsDir 'bridge_server.py') -Force
+# The Antigravity CLI is a shim onto scripts/bridge_server.py rather than a second
+# copy of it. It is deployed under ~/.gemini, so it cannot locate the repo relative
+# to itself - the placeholder is rewritten with the real path here.
+$agShimSrc  = Join-Path $agSkillSrc 'scripts\bridge_server.py'
+$agShimDest = Join-Path $agScriptsDir 'bridge_server.py'
+$canonical  = Join-Path $Root 'scripts\bridge_server.py'
+(Get-Content -Raw -LiteralPath $agShimSrc).Replace('__CANONICAL_BRIDGE_PATH__', $canonical) |
+    Set-Content -LiteralPath $agShimDest -Encoding UTF8
 Ok "installed Antigravity skill to $agSkillDir"
+Info "AG CLI forwards to $canonical"
 
 # Pre-approve permissions in ~/.gemini/config/config.json and project configs so the user gets 0 prompts
 $agMainCfgPath = Join-Path $agConfigDir 'config.json'

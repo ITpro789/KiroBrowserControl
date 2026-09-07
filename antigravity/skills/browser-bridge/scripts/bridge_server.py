@@ -1,250 +1,130 @@
 """
-Robust WebMCP WebSocket & HTTP Bridge Server
+Antigravity CLI shim for the shared browser bridge.
+
+This used to be a full second implementation of the bridge daemon. That was a
+problem for two reasons:
+
+  1. Its --server path called free_port(), which taskkills whatever holds 8765
+     and 8766. If it ever ran while the real bridge was restarting, this stale
+     copy took over the ports, and both agents silently lost every fix made in
+     the canonical repo - dialog handling, per-agent tab groups, the lot.
+  2. Its --action list was a separate copy, so new actions worked for Kiro and
+     failed for Antigravity with an argparse error.
+
+So it is now a thin translator onto the canonical script. One implementation,
+one action list, both agents.
+
+The original is kept alongside as bridge_server.py.fork-backup.
 """
 
-import sys
-import os
-import time
-import json
 import base64
-import uuid
-import asyncio
-import threading
-import argparse
+import os
+import subprocess
+import sys
 from pathlib import Path
-from http.server import HTTPServer, BaseHTTPRequestHandler
-import websockets
 
-HTTP_PORT = 8765
-WS_PORT = 8766
-SHARED_TOKEN_FILE = Path(r"C:\Users\sohai\OneDrive - SKP Consultancy Ltd\Documents\KiroBrowserControl\.bridge-token")
-def get_bridge_token():
-    if SHARED_TOKEN_FILE.exists():
-        return SHARED_TOKEN_FILE.read_text(encoding="utf-8").strip()
-    return ""
+# install.ps1 rewrites the placeholder below with the repo's real location when it
+# deploys this file, because the deployed copy lives under ~/.gemini and cannot
+# find the repo relative to itself. BRIDGE_CANONICAL_PATH overrides it, which is
+# also the escape hatch if the repo is moved after installing.
+# Built by concatenation on purpose: the installer does a plain string replace on
+# this file, so spelling the token out here would rewrite the check below too -
+# and a Windows path in a non-raw literal breaks on \U and \D escapes.
+_PLACEHOLDER = "__CANONICAL" + "_BRIDGE_PATH__"
 
-class WebMCPBridge:
-    def __init__(self):
-        self.clients = set()
-        self.pending = {}
-        self.loop = None
+CANONICAL = Path(
+    os.environ.get("BRIDGE_CANONICAL_PATH")
+    or r"__CANONICAL_BRIDGE_PATH__"
+)
 
-    async def handle_ws(self, websocket):
-        self.clients.add(websocket)
-        print(f"\n[WebMCP] >>> Chrome Extension CONNECTED! Total active clients: {len(self.clients)} <<<")
-        try:
-            async for raw in websocket:
+# Flags whose names differ between the old Antigravity CLI and the canonical one.
+RENAMED = {
+    "--option": "--value",       # select_option's argument
+}
+
+# Flags the old CLI accepted that the canonical script does not.
+DROPPED = {"--code-b64"}
+
+
+def translate(argv):
+    """Map the old Antigravity flag set onto the canonical script's flags."""
+    out = []
+    i = 0
+    while i < len(argv):
+        arg = argv[i]
+
+        # --code-b64 <b64> becomes --code <plain>
+        if arg == "--code-b64":
+            if i + 1 < len(argv):
                 try:
-                    data = json.loads(raw)
-                    cmd_id = data.get("command_id")
-                    if cmd_id and cmd_id in self.pending:
-                        screenshot_data = data.get("screenshot", "")
-                        if screenshot_data and "," in screenshot_data:
-                            b64_str = screenshot_data.split(",", 1)[1]
-                            img_bytes = base64.b64decode(b64_str)
-                            screenshot_file = ARTIFACTS_DIR / "browser_view.png"
-                            with open(screenshot_file, "wb") as f:
-                                f.write(img_bytes)
-                            data["screenshot_saved"] = str(screenshot_file)
-                            del data["screenshot"]
+                    out += ["--code", base64.b64decode(argv[i + 1]).decode("utf-8")]
+                except Exception:
+                    sys.exit("bridge_server shim: --code-b64 is not valid base64")
+                i += 2
+                continue
+            i += 1
+            continue
 
-                        self.save_artifact(data)
-
-                        fut = self.pending.pop(cmd_id)
-                        if not fut.done():
-                            fut.set_result(data)
-                except Exception as e:
-                    print("[WebMCP] Message handling error:", e)
-        finally:
-            self.clients.discard(websocket)
-            print(f"\n[WebMCP] Chrome Extension disconnected. Active clients: {len(self.clients)}")
-
-    def save_artifact(self, data):
-        tab = data.get("tab", {})
-        md_path = ARTIFACTS_DIR / "browser_live.md"
-        content = f"""# Live Browser View (Personal Chrome Session)
-
-**Page Title**: {tab.get('title', 'Unknown')}  
-**Current URL**: [{tab.get('url', 'Unknown')}]({tab.get('url', '#')})
-
-![Live Screen Capture](file:///{str(ARTIFACTS_DIR / 'browser_view.png').replace(chr(92), '/')})
-"""
-        with open(md_path, "w", encoding="utf-8") as f:
-            f.write(content)
-
-    async def send(self, payload, timeout=12):
-        if not self.clients:
-            return {"error": "Extension not connected. Make sure Chrome has the extension loaded and active."}
-
-        cmd_id = str(uuid.uuid4())
-        payload["command_id"] = cmd_id
-        fut = self.loop.create_future()
-        self.pending[cmd_id] = fut
-
-        msg = json.dumps(payload)
-        for ws in list(self.clients):
+        if arg.startswith("--code-b64="):
             try:
-                await ws.send(msg)
+                out += ["--code", base64.b64decode(arg.split("=", 1)[1]).decode("utf-8")]
             except Exception:
-                pass
+                sys.exit("bridge_server shim: --code-b64 is not valid base64")
+            i += 1
+            continue
 
-        try:
-            return await asyncio.wait_for(fut, timeout=timeout)
-        except asyncio.TimeoutError:
-            self.pending.pop(cmd_id, None)
-            return {"error": "Timeout waiting for Chrome extension"}
+        name, sep, value = arg.partition("=")
+        if name in RENAMED:
+            out.append(RENAMED[name] + sep + value if sep else RENAMED[name])
+            i += 1
+            continue
+        if name in DROPPED:
+            i += 2 if not sep else 1
+            continue
 
-bridge = WebMCPBridge()
-
-class HTTPHandler(BaseHTTPRequestHandler):
-    def do_OPTIONS(self):
-        self.send_response(200)
-        self.send_header('Access-Control-Allow-Origin', '*')
-        self.send_header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
-        self.send_header('Access-Control-Allow-Headers', 'Content-Type')
-        self.end_headers()
-
-    def do_GET(self):
-        if self.path == '/status':
-            connected = len(bridge.clients) > 0
-            self.send_response(200)
-            self.send_header('Content-Type', 'application/json')
-            self.send_header('Access-Control-Allow-Origin', '*')
-            self.end_headers()
-            self.wfile.write(json.dumps({"connected": connected, "clients": len(bridge.clients)}).encode('utf-8'))
-        elif self.path == '/portal' or self.path == '/':
-            portal_path = Path(r"C:\Users\sohai\Documents\AccounTech_AI_System\accounting_portal.html")
-            if portal_path.exists():
-                with open(portal_path, "rb") as f:
-                    content = f.read()
-                self.send_response(200)
-                self.send_header('Content-Type', 'text/html; charset=utf-8')
-                self.send_header('Access-Control-Allow-Origin', '*')
-                self.end_headers()
-                self.wfile.write(content)
-            else:
-                self.send_response(404)
-                self.end_headers()
-        else:
-            self.send_response(404)
-            self.end_headers()
-
-    def do_POST(self):
-        content_len = int(self.headers.get('Content-Length', 0))
-        body = self.rfile.read(content_len).decode('utf-8')
-        data = json.loads(body) if body else {}
-
-        if self.path == '/execute':
-            fut = asyncio.run_coroutine_threadsafe(bridge.send(data), bridge.loop)
-            res = fut.result()
-            self.send_response(200)
-            self.send_header('Content-Type', 'application/json')
-            self.send_header('Access-Control-Allow-Origin', '*')
-            self.end_headers()
-            self.wfile.write(json.dumps(res).encode('utf-8'))
-
-    def log_message(self, format, *args):
-        pass
+        out.append(arg)
+        i += 1
+    return out
 
 
-def free_port(port):
-    import subprocess, sys
-    try:
-        if sys.platform == "win32":
-            res = subprocess.run(["netstat", "-ano"], capture_output=True, text=True)
-            for line in res.stdout.splitlines():
-                if f":{port}" in line and "LISTENING" in line:
-                    parts = line.strip().split()
-                    pid = parts[-1]
-                    if pid.isdigit() and int(pid) != os.getpid():
-                        subprocess.run(["taskkill", "/F", "/PID", pid], capture_output=True)
-    except Exception:
-        pass
+def main():
+    argv = sys.argv[1:]
 
-def run_servers():
-    free_port(HTTP_PORT)
-    free_port(WS_PORT)
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    bridge.loop = loop
+    if str(CANONICAL) == _PLACEHOLDER:
+        sys.exit(
+            "bridge_server shim: path not configured. Re-run install.ps1 from the "
+            "KiroBrowserControl repo, or set BRIDGE_CANONICAL_PATH to its "
+            "scripts/bridge_server.py"
+        )
 
-    # Start HTTP server in a separate thread
-    http_server = HTTPServer(('127.0.0.1', HTTP_PORT), HTTPHandler)
-    http_thread = threading.Thread(target=http_server.serve_forever, daemon=True)
-    http_thread.start()
-    print(f"[WebMCP] HTTP API ready on http://127.0.0.1:{HTTP_PORT}")
+    if not CANONICAL.exists():
+        sys.exit(
+            f"bridge_server shim: canonical script not found at {CANONICAL}. "
+            "If the repo moved, re-run install.ps1 or set BRIDGE_CANONICAL_PATH."
+        )
 
-    # Start WebSocket Server
-    async def main():
-        async with websockets.serve(bridge.handle_ws, "127.0.0.1", WS_PORT, max_size=50 * 1024 * 1024):
-            print(f"[WebMCP] WebSocket Server ready on ws://127.0.0.1:{WS_PORT}")
-            await asyncio.Future()
+    # Never start a daemon from here. The KiroBrowserBridge scheduled task owns
+    # the ports; starting another would kill the running one.
+    if "--server" in argv:
+        print("The bridge daemon is managed by the KiroBrowserBridge scheduled task.")
+        print("Check it:   Get-ScheduledTask -TaskName KiroBrowserBridge | "
+              "Select-Object State")
+        print("Start it:   Start-ScheduledTask -TaskName KiroBrowserBridge")
+        return 0
 
-    loop.run_until_complete(main())
+    args = translate(argv)
+
+    # Identify as Antigravity unless the caller already said otherwise, so this
+    # agent gets its own tab and its own tab group.
+    if not any(a in ("--client", "--agent-name") or a.startswith(("--client=", "--agent-name="))
+               for a in args):
+        args += ["--client", "AG"]
+
+    env = dict(os.environ)
+    env.setdefault("BRIDGE_CLIENT_NAME", "AG")
+
+    return subprocess.call([sys.executable, str(CANONICAL), *args], env=env)
+
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="WebMCP Bridge")
-    parser.add_argument("--server", action="store_true")
-    parser.add_argument("--action", choices=["get_state", "navigate", "click", "type", "form_input", "scroll", "switch_tab", "focus_tab", "eval", "key", "select_option", "read_content", "get_errors", "new_tab", "close_tab", "reload_extension"], default="get_state")
-    parser.add_argument("--url", default="")
-    parser.add_argument("--target", default="")
-    parser.add_argument("--option", default="", help="Option text to select from dropdown/combobox")
-    parser.add_argument("--x", type=int, default=None)
-    parser.add_argument("--y", type=int, default=None)
-    parser.add_argument("--text", default="")
-    parser.add_argument("--key", help="Key name to send via CDP (ArrowDown, ArrowUp, Enter, Tab, Escape, etc.)")
-    parser.add_argument("--code", help="Javascript expression to evaluate")
-    parser.add_argument("--code-b64", help="Base64 encoded javascript expression to evaluate")
-    parser.add_argument("--enter", action="store_true", help="Press enter after typing")
-    parser.add_argument("--direction", default="down")
-    parser.add_argument("--amount", type=int, default=500)
-    parser.add_argument("--tab-id", type=int, default=None)
-
-    args = parser.parse_args()
-
-    if args.server:
-        import socket
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        result = sock.connect_ex(('127.0.0.1', HTTP_PORT))
-        sock.close()
-        if result == 0:
-            print(f"[WebMCP] Universal Browser Bridge is already running and listening on http://127.0.0.1:{HTTP_PORT}")
-            sys.exit(0)
-        run_servers()
-    else:
-        import urllib.request
-        import base64
-        code = args.code
-        if args.code_b64:
-            code = base64.b64decode(args.code_b64).decode('utf-8')
-        payload = {
-            "action": args.action,
-            "agent_name": "AG",
-            "url": args.url,
-            "target": args.target,
-            "option": args.option,
-            "x": args.x,
-            "y": args.y,
-            "text": args.text,
-            "key": args.key,
-            "code": code,
-            "enter": args.enter,
-            "direction": args.direction,
-            "amount": args.amount,
-            "tab_id": args.tab_id
-        }
-        tok = get_bridge_token()
-        headers = {'Content-Type': 'application/json'}
-        if tok:
-            headers['X-Bridge-Token'] = tok
-
-        req = urllib.request.Request(
-            f"http://127.0.0.1:{HTTP_PORT}/execute",
-            data=json.dumps(payload).encode('utf-8'),
-            headers=headers
-        )
-        try:
-            with urllib.request.urlopen(req, timeout=35) as resp:
-                print(resp.read().decode('utf-8'))
-        except Exception as e:
-            print(json.dumps({"error": f"Failed: {e}"}))
+    sys.exit(main())

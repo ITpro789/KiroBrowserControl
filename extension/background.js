@@ -271,8 +271,18 @@ function getAgentStyle(agentName) {
   return AGENT_STYLES[normaliseAgent(agentName)];
 }
 
-// agent key -> tabId
+// agent key -> { current: tabId|null, tabs: tabId[] }
+//
+// An agent owns a set of tabs, not one. new_tab used to overwrite the single
+// slot, which orphaned the previous tab: it stayed open and grouped but nothing
+// tracked it, so it was neither reused nor closed nor recognised as agent-owned.
 let agentTabs = Object.create(null);
+
+function agentEntry(agent) {
+  const key = normaliseAgent(agent);
+  if (!agentTabs[key]) agentTabs[key] = { current: null, tabs: [] };
+  return agentTabs[key];
+}
 
 // Where to hand focus back to if anything ever has to foreground an agent tab.
 let lastUserTabId = null;
@@ -287,10 +297,14 @@ chrome.storage.local.get('bridgeStealFocus').then(({ bridgeStealFocus }) => {
 // Rehydrate on every worker start, so the popup and getAllTabs know which tabs
 // belong to which agent before any command has run.
 chrome.storage.session.get('agentTabs').then(({ agentTabs: stored }) => {
-  if (stored && typeof stored === 'object') {
-    for (const [agent, tabId] of Object.entries(stored)) {
-      if (!agentTabs[agent]) agentTabs[agent] = tabId;
-    }
+  if (!stored || typeof stored !== 'object') return;
+  for (const [agent, value] of Object.entries(stored)) {
+    if (agentTabs[agent]) continue;
+    // Tolerate the older single-id shape so a worker restart mid-upgrade does
+    // not lose the tab and strand it outside the group.
+    agentTabs[agent] = (value && typeof value === 'object')
+      ? { current: value.current || null, tabs: Array.isArray(value.tabs) ? value.tabs : [] }
+      : { current: value || null, tabs: value ? [value] : [] };
   }
 }).catch(() => {});
 
@@ -328,17 +342,26 @@ async function persistAgentTabs() {
   } catch (e) { /* session storage unavailable */ }
 }
 
-async function rememberAgentTab(agent, tabId) {
-  agentTabs[normaliseAgent(agent)] = tabId;
+async function rememberAgentTab(agent, tabId, makeCurrent = true) {
+  const entry = agentEntry(agent);
+  if (!entry.tabs.includes(tabId)) entry.tabs.push(tabId);
+  if (makeCurrent) entry.current = tabId;
   await persistAgentTabs();
 }
 
 /** Called when a tab closes, so it is keyed by tab rather than by agent. */
 async function forgetAgentTab(tabId) {
   let changed = false;
-  for (const [agent, id] of Object.entries(agentTabs)) {
-    if (id === tabId) {
-      delete agentTabs[agent];
+  for (const entry of Object.values(agentTabs)) {
+    const idx = entry.tabs.indexOf(tabId);
+    if (idx !== -1) {
+      entry.tabs.splice(idx, 1);
+      changed = true;
+    }
+    if (entry.current === tabId) {
+      // Promote a sibling rather than dropping to null, so closing the active
+      // agent tab mid-task does not force a brand new one to be created.
+      entry.current = entry.tabs.length ? entry.tabs[entry.tabs.length - 1] : null;
       changed = true;
     }
   }
@@ -346,17 +369,25 @@ async function forgetAgentTab(tabId) {
 }
 
 function agentOwning(tabId) {
-  for (const [agent, id] of Object.entries(agentTabs)) {
-    if (id === tabId) return agent;
+  for (const [agent, entry] of Object.entries(agentTabs)) {
+    if (entry.tabs.includes(tabId)) return agent;
   }
   return null;
+}
+
+function allAgentTabIds() {
+  return Object.values(agentTabs).flatMap((e) => e.tabs);
 }
 
 async function recallAgentTab(agent) {
   try {
     const { agentTabs: stored } = await chrome.storage.session.get('agentTabs');
-    const tabId = stored && stored[normaliseAgent(agent)];
-    if (tabId) {
+    const value = stored && stored[normaliseAgent(agent)];
+    const ids = (value && typeof value === 'object')
+      ? [value.current, ...(value.tabs || [])]
+      : [value];
+    for (const tabId of ids) {
+      if (!tabId) continue;
       const tab = await getTabOrNull(tabId);
       if (tab) return tab;
     }
@@ -372,7 +403,7 @@ async function recallAgentTab(agent) {
 async function findGroupedAgentTab(agent) {
   if (!chrome.tabGroups) return null;
   const { title } = getAgentStyle(agent);
-  const claimed = new Set(Object.values(agentTabs));
+  const claimed = new Set(allAgentTabIds());
   try {
     const groups = await chrome.tabGroups.query({ title });
     for (const group of groups) {
@@ -386,44 +417,67 @@ async function findGroupedAgentTab(agent) {
   return null;
 }
 
-async function updateAgentGroupStyle(tabId, requestedAgent = DEFAULT_AGENT) {
+/**
+ * Put a tab into this agent's group, reusing that group when it already exists
+ * in the same window. Creating a group per tab was giving N tabs = N groups.
+ *
+ * Title and colour are only written when the group is created. Rewriting them on
+ * every join churned the tab strip and would clobber a rename by the user.
+ */
+async function attachToAgentGroup(tabId, requestedAgent = DEFAULT_AGENT) {
   if (!chrome.tabGroups || !tabId) return;
+
+  const style = getAgentStyle(requestedAgent);
+  const ungrouped = chrome.tabGroups.TAB_GROUP_ID_NONE;
+
   try {
     const tab = await getTabOrNull(tabId);
     if (!tab) return;
 
-    const style = getAgentStyle(requestedAgent);
-    const ungrouped = chrome.tabGroups.TAB_GROUP_ID_NONE;
-    let groupId = tab.groupId;
-    const isGrouped = groupId && groupId !== ungrouped && groupId !== -1;
-
-    if (isGrouped) {
-      // If this tab is sitting in the other agent's group, move it into its own
-      // rather than renaming a group that is not ours.
+    // Already in a correctly titled group in this window: nothing to do.
+    if (tab.groupId && tab.groupId !== ungrouped && tab.groupId !== -1) {
       let current = null;
-      try { current = await chrome.tabGroups.get(groupId); } catch (e) { /* gone */ }
-      const belongsToAnother = current && current.title && current.title !== style.title
-        && Object.values(AGENT_STYLES).some((s) => s.title === current.title);
+      try { current = await chrome.tabGroups.get(tab.groupId); } catch (e) { /* gone */ }
+      if (current && current.title === style.title) return;
 
-      if (belongsToAnother) {
+      const otherAgentsGroup = current && current.title
+        && Object.values(AGENT_STYLES).some((s) => s.title === current.title);
+      if (otherAgentsGroup) {
         await chrome.tabs.ungroup(tab.id);
-        groupId = await chrome.tabs.group({ tabIds: tab.id });
-      } else if (current && current.title === style.title && current.color === style.color) {
-        return;   // already correct, do not churn the tab strip
       }
-    } else {
-      groupId = await chrome.tabs.group({ tabIds: tab.id });
     }
 
+    // Reuse this agent's existing group in the same window if there is one. The
+    // query can return a group that has since been emptied and dropped, so the
+    // join is retried as a fresh group rather than failing the command.
+    let existing = null;
+    try {
+      const groups = await chrome.tabGroups.query({ title: style.title, windowId: tab.windowId });
+      existing = groups && groups[0];
+    } catch (e) { /* fall through to creating one */ }
+
+    if (existing) {
+      try {
+        await chrome.tabs.group({ tabIds: [tab.id], groupId: existing.id });
+        return;
+      } catch (e) { /* group vanished between query and join */ }
+    }
+
+    const groupId = await chrome.tabs.group({
+      tabIds: [tab.id],
+      createProperties: { windowId: tab.windowId }
+    });
     await chrome.tabGroups.update(groupId, {
       title: style.title,
       color: style.color,
       collapsed: false
     });
   } catch (e) {
-    console.warn('[bridge] could not update agent tab group style:', e && e.message);
+    console.warn('[bridge] could not place tab in the agent group:', e && e.message);
   }
 }
+
+
 
 async function pickHostWindowId() {
   try {
@@ -441,23 +495,43 @@ async function pickHostWindowId() {
 async function ensureAgentTab(agentName = DEFAULT_AGENT) {
   const agent = normaliseAgent(agentName);
 
-  let tab = await getTabOrNull(agentTabs[agent]);
+  const entry = agentEntry(agent);
+
+  let tab = await getTabOrNull(entry.current);
   if (tab) {
-    await updateAgentGroupStyle(tab.id, agent);
+    await attachToAgentGroup(tab.id, agent);
     return { tab, source: 'memory', agent };
+  }
+
+  // The current tab is gone but a sibling this agent opened may still be alive.
+  // Reusing it is what stops a closed tab from forcing a brand new one.
+  for (const candidate of [...entry.tabs].reverse()) {
+    tab = await getTabOrNull(candidate);
+    if (tab) {
+      await rememberAgentTab(agent, tab.id);
+      await attachToAgentGroup(tab.id, agent);
+      return { tab, source: 'sibling', agent };
+    }
+  }
+
+  // Drop ids that no longer resolve, so the list does not grow forever.
+  if (entry.tabs.length) {
+    entry.tabs = [];
+    entry.current = null;
+    await persistAgentTabs();
   }
 
   tab = await recallAgentTab(agent);
   if (tab) {
     await rememberAgentTab(agent, tab.id);
-    await updateAgentGroupStyle(tab.id, agent);
+    await attachToAgentGroup(tab.id, agent);
     return { tab, source: 'session', agent };
   }
 
   tab = await findGroupedAgentTab(agent);
   if (tab) {
     await rememberAgentTab(agent, tab.id);
-    await updateAgentGroupStyle(tab.id, agent);
+    await attachToAgentGroup(tab.id, agent);
     return { tab, source: 'group', agent };
   }
 
@@ -468,7 +542,7 @@ async function ensureAgentTab(agentName = DEFAULT_AGENT) {
     ...(windowId ? { windowId } : {})
   });
   await rememberAgentTab(agent, created.id);
-  await updateAgentGroupStyle(created.id, agent);
+  await attachToAgentGroup(created.id, agent);
 
   return { tab: (await getTabOrNull(created.id)) || created, source: 'created', agent };
 }
@@ -498,6 +572,7 @@ async function getAllTabs() {
     title: t.title,
     url: t.url,
     active: t.active,
+    group_id: t.groupId,
     agent: agentOwning(t.id) !== null,
     agent_name: agentOwning(t.id) || undefined
   }));
@@ -1069,6 +1144,25 @@ async function handleCommand(cmd) {
         };
       }
 
+      case 'ensure_tab': {
+        // getTargetTab already ran ensureAgentTab, so the tab exists by now.
+        // 'created' means there was nothing to reuse; anything else is a reuse.
+        const current = await chrome.tabs.get(tabId);
+        return {
+          status: 'ok',
+          reused: tabSource !== 'created',
+          tab: {
+            id: current.id,
+            title: current.title,
+            url: current.url,
+            agent: true,
+            agent_name: activeAgent,
+            source: tabSource
+          },
+          tabs: await getAllTabs()
+        };
+      }
+
       case 'new_tab': {
         const windowId = await pickHostWindowId();
         let url = cmd.url || 'about:blank';
@@ -1078,9 +1172,10 @@ async function handleCommand(cmd) {
           active: false,
           ...(windowId ? { windowId } : {})
         });
-        // The new tab becomes this agent's working tab, and only this agent's.
+        // Joins this agent's existing group rather than making another one, and
+        // is tracked alongside its siblings instead of replacing them.
         await rememberAgentTab(activeAgent, created.id);
-        await updateAgentGroupStyle(created.id, activeAgent);
+        await attachToAgentGroup(created.id, activeAgent);
         if (url !== 'about:blank') {
           await waitForLoad(created.id);
         }
@@ -1099,7 +1194,7 @@ async function handleCommand(cmd) {
       }
 
       case 'close_tab': {
-        const targetId = cmd.tab_id || agentTabs[activeAgent];
+        const targetId = cmd.tab_id || agentEntry(activeAgent).current;
 
         // Refuse to close a tab belonging to the other agent, or one the user
         // owns. Only an explicit tab_id can target outside this agent's tab.
@@ -1405,7 +1500,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, reply) => {
   if (msg && msg.type === 'close_agent_tab') {
     // Closes every agent tab, since the popup is the user's control not an
     // agent's, and they should not have to close them one at a time.
-    const ids = Object.values(agentTabs).filter(Boolean);
+    const ids = allAgentTabIds();
     Promise.all(ids.map((id) => forgetAgentTab(id)))
       .then(() => Promise.all(ids.map((id) => chrome.tabs.remove(id).catch(() => {}))))
       .then(() => reply({ ok: true }))

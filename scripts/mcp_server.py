@@ -380,6 +380,16 @@ TOOLS = [
         },
     },
     {
+        "name": "browser_ensure_tab",
+        "description": (
+            "Return your working tab, reusing the existing one if it is still open and "
+            "only creating one if there is none. Idempotent, so it is safe to call at the "
+            "start of a task or after the user has closed tabs. Prefer this over "
+            "browser_new_tab, which always adds another tab."
+        ),
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
         "name": "browser_new_tab",
         "description": "Open a new background tab in the agent tab group with an optional URL.",
         "inputSchema": {
@@ -434,6 +444,7 @@ ACTION_FOR = {
     "browser_key": "key",
     "browser_scroll": "scroll",
     "browser_list_tabs": "get_state",
+    "browser_ensure_tab": "ensure_tab",
     "browser_use_tab": "switch_tab",
     "browser_focus_tab": "focus_tab",
     "browser_eval": "eval",

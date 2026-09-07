@@ -23,6 +23,7 @@ asking him to click things.
 | `browser_key` | Press a named key (supports modifiers: Control, Shift, Alt, Meta) |
 | `browser_scroll` | Scroll up or down |
 | `browser_list_tabs` | List open tabs with ids; `[agent]` marks the agent tab |
+| `browser_ensure_tab` | Get your working tab, reusing it if still open |
 | `browser_use_tab` | Adopt an existing tab as the working tab |
 | `browser_new_tab` | Open a new tab in the agent tab group |
 | `browser_close_tab` | Close the agent tab |
@@ -34,6 +35,12 @@ asking him to click things.
 Every tool acts on one tab the agent owns, held in a tab group labelled
 **Kiro**. It is created on the first command and is never activated, so he can
 keep browsing in his own tab while you work. Do not try to work around this.
+
+**You never need to create a tab.** Every ordinary call auto-recovers: if your
+tab was closed, the next `browser_navigate` or `browser_get_state` reuses a
+sibling you still have open, or makes one. Reach for `browser_ensure_tab` if you
+want that explicitly. Only use `browser_new_tab` when you genuinely need a
+*second* page open at the same time — it always adds one.
 
 - Without `tab_id`, tools act on the Kiro tab. This is what you want.
 - Pass `tab_id` for a one-off action on another tab.
@@ -101,11 +108,40 @@ Other notes:
 - Pass `tab_id` to target a specific tab. Without it you get the Kiro tab.
 - `chrome://`, `edge://`, and extension pages cannot be automated. Chrome
   blocks debugger attachment to them.
+- Cross-origin iframes are a blind spot. See below before you trust a result.
 - A page that has just loaded may report very few elements. Re-read state.
 - Expect a yellow "being debugged by automated software" bar on attached tabs.
   Normal, not a fault.
 - DevTools cannot be open on a tab the bridge has attached to. One debugger
   client per tab.
+
+## Cross-origin iframes: typing fails silently
+
+The element scan cannot read across an origin boundary, so a page whose content
+sits in a foreign iframe returns **only the outer page's chrome** - no rows, no
+inputs, no toolbar. Known case: the Azure portal Conditional Access blade, which
+renders from `*.hosting.portal.azure.com` inside `portal.azure.com`. Blades that
+work are the ones hosted in the main document.
+
+The dangerous part is that the failure modes differ:
+
+| | Behaviour |
+| --- | --- |
+| Element scan | Returns nothing from the iframe. Obvious. |
+| `browser_click` by x/y | Probably **works** - mouse events route by hit-test |
+| `browser_type` / `browser_key` | **Fails silently.** No error, nothing typed |
+
+Keystrokes are dispatched on the main-frame session, so when focus is inside the
+cross-origin iframe they go nowhere and the page never errors. Do not read "no
+error" as "it worked".
+
+If `browser_get_state` gives you only navigation and no page content:
+
+1. Say so rather than guessing coordinates.
+2. Try `browser_read_content`, which sometimes still recovers text.
+3. Do not report a form as filled unless you have re-read state and can see the
+   value. On these blades you cannot.
+4. Hand it back to Sohail for that step. Tell him which blade and why.
 
 ## If a tool returns "extension not connected"
 

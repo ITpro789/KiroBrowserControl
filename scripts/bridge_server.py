@@ -484,7 +484,7 @@ def main():
                         choices=["get_state", "navigate", "click", "type", "form_input",
                                  "scroll", "switch_tab", "focus_tab", "eval", "key",
                                  "select_option", "read_content", "get_errors", "new_tab",
-                                 "close_tab", "reload_extension"])
+                                 "close_tab", "ensure_tab", "reload_extension"])
     parser.add_argument("--url", default="")
     parser.add_argument("--target", default="")
     parser.add_argument("--value", default="", help="option value or text for select_option")

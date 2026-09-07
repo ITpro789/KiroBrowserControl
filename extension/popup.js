@@ -8,17 +8,21 @@ const agentState = document.getElementById('agentState');
 const steal      = document.getElementById('stealFocus');
 
 function describeAgentTabs(map) {
-  const entries = Object.entries(map || {}).filter(([, id]) => !!id);
+  const entries = Object.entries(map || {})
+    .map(([agent, e]) => [agent, (e && e.tabs) || []])
+    .filter(([, tabs]) => tabs.length);
+
   if (!entries.length) {
     agentState.textContent = 'none yet - created on first command';
     return;
   }
 
   agentState.textContent = 'loading…';
-  Promise.all(entries.map(([agent, id]) => new Promise((resolve) => {
-    chrome.tabs.get(id, (tab) => {
+  Promise.all(entries.map(([agent, tabs]) => new Promise((resolve) => {
+    chrome.tabs.get(tabs[tabs.length - 1], (tab) => {
       if (chrome.runtime.lastError || !tab) return resolve(null);
-      resolve(`${agent}: ${(tab.title || tab.url || '').slice(0, 38)}`);
+      const extra = tabs.length > 1 ? ` (+${tabs.length - 1})` : '';
+      resolve(`${agent}${extra}: ${(tab.title || tab.url || '').slice(0, 34)}`);
     });
   }))).then((rows) => {
     const found = rows.filter(Boolean);

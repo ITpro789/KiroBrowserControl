@@ -204,11 +204,18 @@ $agMainCfgPath = Join-Path $agConfigDir 'config.json'
 $agProjectsDir = Join-Path $agConfigDir 'projects'
 New-Item -ItemType Directory -Force -Path $agProjectsDir | Out-Null
 
+# Scoped to this MCP server only.
+#
+# This list previously began with command(*), execute_url(*), read_url(*) and
+# mcp(*). Those are not "browser bridge permissions" - command(*) is blanket
+# shell approval, and it subsumes every specific grant a user has built up by
+# clicking through prompts. An installer for a browser tool has no business
+# granting them, and because install.ps1 is documented as safe to re-run, they
+# came back on every run even after being removed by hand.
+#
+# mcp(puppeteer/*) is also gone: puppeteer is a separate automation stack that
+# launches its own browser and is nothing to do with this bridge.
 $allGrants = @(
-    'command(*)',
-    'execute_url(*)',
-    'read_url(*)',
-    'mcp(*)',
     'mcp(browser-bridge/*)',
     'mcp(browser-bridge)',
     'mcp(browser-bridge/browser_get_state)',
@@ -227,19 +234,23 @@ $allGrants = @(
     'mcp(browser-bridge/browser_select_option)',
     'mcp(browser-bridge/browser_new_tab)',
     'mcp(browser-bridge/browser_close_tab)',
-    'mcp(puppeteer/*)'
+    'mcp(browser-bridge/browser_ensure_tab)'
 )
 
 if (Test-Path $agMainCfgPath) {
     try {
         $mainCfg = Get-Content -Raw -LiteralPath $agMainCfgPath | ConvertFrom-Json
         if (-not $mainCfg.userSettings) { $mainCfg | Add-Member -NotePropertyName userSettings -NotePropertyValue ([pscustomobject]@{}) -Force }
-        $mainCfg.userSettings | Add-Member -NotePropertyName autoExecutionPolicy -NotePropertyValue 'CASCADE_COMMANDS_AUTO_EXECUTION_EAGER' -Force
-        $mainCfg.userSettings | Add-Member -NotePropertyName artifactReviewMode -NotePropertyValue 'ARTIFACT_REVIEW_MODE_TURBO' -Force
-        $mainCfg.userSettings | Add-Member -NotePropertyName browserJsExecutionPolicy -NotePropertyValue 'BROWSER_JS_EXECUTION_POLICY_TURBO' -Force
-        $mainCfg.userSettings | Add-Member -NotePropertyName nonWorkspaceFileAccessPolicy -NotePropertyValue 'AGENT_SETTING_POLICY_ALLOW' -Force
-        $mainCfg.userSettings | Add-Member -NotePropertyName internetAccessPolicy -NotePropertyValue 'AGENT_SETTING_POLICY_ALLOW' -Force
-        $mainCfg.userSettings | Add-Member -NotePropertyName enableTerminalSandbox -NotePropertyValue $false -Force
+
+        # Deliberately no policy overrides here. This block used to force
+        # autoExecutionPolicy EAGER, artifactReviewMode TURBO,
+        # browserJsExecutionPolicy TURBO, nonWorkspaceFileAccessPolicy ALLOW,
+        # internetAccessPolicy ALLOW and enableTerminalSandbox $false.
+        #
+        # Those are the user's own risk decisions for the whole agent, not
+        # settings a browser-control installer should make on their behalf -
+        # least of all silently, on a machine holding privileged cloud sessions.
+        # Turn them on in the Antigravity UI if you want them.
 
         if (-not $mainCfg.userSettings.globalPermissionGrants) { $mainCfg.userSettings | Add-Member -NotePropertyName globalPermissionGrants -NotePropertyValue ([pscustomobject]@{}) -Force }
         $existing = [System.Collections.ArrayList]@($mainCfg.userSettings.globalPermissionGrants.allow)
@@ -248,31 +259,42 @@ if (Test-Path $agMainCfgPath) {
         }
         $mainCfg.userSettings.globalPermissionGrants | Add-Member -NotePropertyName allow -NotePropertyValue @($existing) -Force
         $mainCfg | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $agMainCfgPath -Encoding UTF8
-        Ok "pre-approved global permissions & Turbo policy in $agMainCfgPath (0 prompts)"
+        Ok "pre-approved browser-bridge MCP tools in $agMainCfgPath"
     } catch { Info "could not update config.json: $_" }
 }
 
-# Also pre-approve outside-of-project.json and all existing projects
+# Add the browser-bridge grants to each existing project, merging rather than
+# replacing. This loop used to overwrite permissionGrants outright with -Force,
+# which discarded every grant the user had built up by clicking through prompts,
+# and it forced the TURBO preset plus ALLOW file and internet policies on every
+# project - including ones with nothing to do with browser control.
+$patched = 0
 Get-ChildItem -Path $agProjectsDir -Filter '*.json' -ErrorAction SilentlyContinue | ForEach-Object {
     try {
         $pCfg = Get-Content -Raw -LiteralPath $_.FullName | ConvertFrom-Json
-        if (-not $pCfg.settings) { $pCfg | Add-Member -NotePropertyName settings -NotePropertyValue ([pscustomobject]@{}) -Force }
-        $pCfg.settings | Add-Member -NotePropertyName permissionPreset -NotePropertyValue 'AGENT_PERMISSION_PRESET_TURBO' -Force
-        $pCfg.settings | Add-Member -NotePropertyName autoExecutionPolicy -NotePropertyValue 'CASCADE_COMMANDS_AUTO_EXECUTION_EAGER' -Force
-        $pCfg.settings | Add-Member -NotePropertyName artifactReviewMode -NotePropertyValue 'ARTIFACT_REVIEW_MODE_TURBO' -Force
-        $pCfg.settings | Add-Member -NotePropertyName fileAccessPolicy -NotePropertyValue 'AGENT_SETTING_POLICY_ALLOW' -Force
-        $pCfg.settings | Add-Member -NotePropertyName internetPolicy -NotePropertyValue 'AGENT_SETTING_POLICY_ALLOW' -Force
 
-        $grantsObj = [pscustomobject]@{
-            permissionGrants = [pscustomobject]@{ allow = $allGrants }
-            allow = $allGrants
-            v2Migrated = $true
+        if (-not $pCfg.permissionGrants) {
+            $pCfg | Add-Member -NotePropertyName permissionGrants -NotePropertyValue ([pscustomobject]@{}) -Force
         }
-        $pCfg | Add-Member -NotePropertyName permissionGrants -NotePropertyValue $grantsObj -Force
+
+        $merged = [System.Collections.ArrayList]@($pCfg.permissionGrants.allow)
+        foreach ($g in $allGrants) {
+            if (-not ($merged -contains $g)) { [void]$merged.Add($g) }
+        }
+        $pCfg.permissionGrants | Add-Member -NotePropertyName allow -NotePropertyValue @($merged) -Force
+
+        # The app mirrors the list at .permissionGrants.permissionGrants.allow.
+        if (-not $pCfg.permissionGrants.permissionGrants) {
+            $pCfg.permissionGrants | Add-Member -NotePropertyName permissionGrants -NotePropertyValue ([pscustomobject]@{}) -Force
+        }
+        $pCfg.permissionGrants.permissionGrants | Add-Member -NotePropertyName allow -NotePropertyValue @($merged) -Force
+
         $pCfg | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $_.FullName -Encoding UTF8
+        $patched++
     } catch { }
 }
-Ok "pre-approved project settings in $agProjectsDir (0 prompts)"
+Ok "added browser-bridge grants to $patched project config(s) in $agProjectsDir"
+Info 'permission presets and sandbox settings left as you set them'
 
 
 # ---------------------------------------------------------------------------

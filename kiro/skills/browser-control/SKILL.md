@@ -14,7 +14,7 @@ asking him to click things.
 | --- | --- |
 | `browser_get_state` | URL, title, numbered interactive elements with offscreen visual badges, screenshot |
 | `browser_navigate` | Go to a URL |
-| `browser_click` | Click by element number, or raw x/y |
+| `browser_click` | Click by element number, visible text, CSS selector, or screenshot x/y |
 | `browser_type` | Type into whatever currently has focus |
 | `browser_fill` | Set a field by element number or CSS selector (React-safe) |
 | `browser_select_option` | Select an option in a dropdown or combobox by element number or value |
@@ -28,6 +28,7 @@ asking him to click things.
 | `browser_new_tab` | Open a new tab in the agent tab group |
 | `browser_close_tab` | Close the agent tab |
 | `browser_focus_tab` | Bring the working tab to the front (interrupts him) |
+| `browser_wait_for` | Wait for expected text to appear across any frame before proceeding (default 4000ms) |
 | `browser_eval` | Run JS - only works if the bridge was started with `--allow-eval` |
 
 ## You work in a background tab, not his tab
@@ -105,43 +106,78 @@ Other notes:
 - `browser_fill` beats `browser_type` for form fields. It uses the native
   property setter, so React, Angular and Vue register the change. Plain typing
   often leaves framework state stale.
+- `enter: true` on `browser_fill`: Atomically sets the field and dispatches Enter in one call.
+  Use this for search boxes and filters to eliminate a separate `browser_key` turn.
+- `assert_text: "..."` on `browser_click` and `browser_fill`: re-reads the element
+  **live**, at the moment of the action, and aborts if its text no longer
+  contains the substring. So if "Save draft" has become "Delete everything"
+  since your last `browser_get_state`, the click is refused. On `browser_click`
+  it also refuses when something covers the click point (a modal, a toast).
+  **Use it on every click that changes something** - submit, delete, assign,
+  approve, save. It costs nothing and it is the only check against the page
+  having moved under you.
+- `within: <container_id>` on `browser_click`: aborts unless the target is inside
+  that container (a modal or flyout), and applies the same covered-click check.
+- `browser_click` with `text: "Yes, my app contains ads"` clicks the element
+  with that visible text, in any frame or open shadow root. With
+  `selector: "material-radio[value='yes']"` it clicks a CSS match; the two
+  combine. If more than one element matches, **nothing is clicked** and the
+  matches are listed - make it more specific. The response says which element
+  was clicked and whether it was a real mouse click or a script click.
+- Radios, checkboxes and switches show their state in the list: `[x]` checked,
+  `[ ]` not. After clicking one, re-read state and confirm it flipped.
+  Custom controls (`material-radio`, `mat-checkbox`, `role="radio"`...) and
+  visually-hidden native inputs are indexed; a hidden input is badged via its
+  label. `{hidden control - clicked by script}` means it has nothing visible to
+  click, so it is toggled with `element.click()`.
+- Raw `x`/`y` on `browser_click` and `browser_scroll` are **screenshot pixels**,
+  converted to page pixels for you when the screenshot was shrunk. Pass
+  `coord_space: "css"` if your numbers are page pixels. Prefer a number, text
+  or selector over coordinates whenever you can.
+- `browser_wait_for`: polls every frame for text (default 4s, max 10s). Use it
+  after an action that loads something, instead of re-reading state in a loop.
+- `browser_scroll` uses a real mouse wheel at the viewport centre, so it moves
+  the panel under that point, not the whole page. Pass `x`/`y` to scroll a
+  different panel, or `target` to bring one element into view.
 - Pass `tab_id` to target a specific tab. Without it you get the Kiro tab.
 - `chrome://`, `edge://`, and extension pages cannot be automated. Chrome
   blocks debugger attachment to them.
-- Cross-origin iframes are a blind spot. See below before you trust a result.
 - A page that has just loaded may report very few elements. Re-read state.
 - Expect a yellow "being debugged by automated software" bar on attached tabs.
   Normal, not a fault.
 - DevTools cannot be open on a tab the bridge has attached to. One debugger
   client per tab.
 
-## Cross-origin iframes: typing fails silently
+## Cross-origin iframes
 
-The element scan cannot read across an origin boundary, so a page whose content
-sits in a foreign iframe returns **only the outer page's chrome** - no rows, no
-inputs, no toolbar. Known case: the Azure portal Conditional Access blade, which
-renders from `*.hosting.portal.azure.com` inside `portal.azure.com`. Blades that
-work are the ones hosted in the main document.
+Some portals render their content inside an iframe from a different origin -
+the Azure portal hosts many blades on `*.hosting.portal.azure.net` inside
+`portal.azure.com`. From v1.5.0 these frames are scanned and driven:
 
-The dangerous part is that the failure modes differ:
+- Elements inside them appear in the list, marked `{frame}`.
+- `browser_click`, `browser_fill`, `browser_type`, `browser_key`,
+  `browser_select_option`, `browser_scroll`, `browser_wait_for` and
+  `browser_read_content` all work inside them.
 
-| | Behaviour |
-| --- | --- |
-| Element scan | Returns nothing from the iframe. Obvious. |
-| `browser_click` by x/y | Probably **works** - mouse events route by hit-test |
-| `browser_type` / `browser_key` | **Fails silently.** No error, nothing typed |
+Tested against a genuine cross-origin frame (separate site, separate process),
+including a hostile page trying to forge frame positions to redirect clicks.
+**Not yet tested on the real Azure portal.** The first time you use it on a
+blade that previously showed only page chrome - Conditional Access especially -
+re-read state after every fill and confirm the value is really there before
+telling Sohail it is done.
 
-Keystrokes are dispatched on the main-frame session, so when focus is inside the
-cross-origin iframe they go nowhere and the page never errors. Do not read "no
-error" as "it worked".
+Limits:
 
-If `browser_get_state` gives you only navigation and no page content:
-
-1. Say so rather than guessing coordinates.
-2. Try `browser_read_content`, which sometimes still recovers text.
-3. Do not report a form as filled unless you have re-read state and can see the
-   value. On these blades you cannot.
-4. Hand it back to Sohail for that step. Tell him which blade and why.
+- **Open shadow roots are scanned** (marked `{shadow}`); **closed ones cannot
+  be**, by design of the browser. If a web component shows no inner controls,
+  try `browser_click` with `text`.
+- An element marked `{position unknown - fill only}` is in a frame whose
+  position could not be confirmed. `browser_fill` and `browser_select_option`
+  still work on it; `browser_click` by number is refused. Call
+  `browser_get_state` again.
+- Each response carries `element_scan`. If `world` is `main`, the all-frames
+  scan failed and only the top frame was indexed - frame content is missing
+  from the list, not absent from the page. `error` says why.
 
 ## If a tool returns "extension not connected"
 

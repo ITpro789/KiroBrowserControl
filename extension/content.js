@@ -80,4 +80,12 @@
   if (proto === 'http:' || proto === 'https:' || proto === 'file:') {
     keepAlive();
   }
+
+  // Frame-position tracking for cross-origin iframes deliberately does not live
+  // here. It was briefly added with a listener that accepted __kiro_frame_pos
+  // from any sender, which let a page forge its own offset and redirect every
+  // click. It now lives in background.js (PREPARE_FRAME), is injected per scan
+  // with a fresh nonce, and checks the sender. Do not reintroduce a listener
+  // here: content scripts share the isolated world with it, so an unchecked one
+  // would overwrite the checked offset.
 })();

@@ -139,32 +139,85 @@ python $B --action click --target <BADGE_NUMBER> --on-dialog accept
 python $B --action click --target <BADGE_NUMBER> --on-dialog accept --dialog-text "typed into prompt()"
 ```
 
+### 11. Production Primitives: Atomic Enter, Assertions & Containment (v1.5.0+)
+```powershell
+# Atomic Enter with form_input (sets text and submits search/filter in one turn)
+python $B --action form_input --target <BADGE_NUMBER> --text "SearchTerm" --enter
+
+# Checked click: re-reads the element LIVE and refuses if its text changed since
+# get_state, or if something covers its click point. Use on every click that
+# changes something - submit, delete, assign, approve, save.
+python $B --action click --target <BADGE_NUMBER> --assert-text "Confirm Action"
+
+# Refuse unless the target is inside that container (a modal or flyout). Same
+# covered-click check.
+python $B --action click --target <BADGE_NUMBER> --within <CONTAINER_BADGE_NUMBER>
+
+# Wait for text to appear in any frame (default 4000ms, max 10000)
+python $B --action wait_for --text "Successfully created" --timeout 4000
+
+# Scroll uses a real mouse wheel at the viewport centre, so it moves the panel
+# under that point rather than the whole page. --x/--y pick another panel;
+# --target brings one element into view.
+python $B --action scroll --direction down --x 400 --y 300
+python $B --action scroll --target <BADGE_NUMBER>
+```
+
+### 12. Click by text or CSS selector, and custom controls
+```powershell
+# By visible text, in any frame or open shadow root. Exact match preferred.
+python $B --action click --text "Yes, my app contains ads"
+
+# By CSS selector; combine with --text to narrow it
+python $B --action click --selector "material-radio[value='yes']"
+python $B --action click --selector "mat-radio-button" --text "Option Alpha"
+```
+
+If more than one element matches, **nothing is clicked** and the matches are
+listed - make it more specific or click by number. `action_result` in the
+response says what was clicked and whether it was a real mouse click (`mouse`)
+or `element.click()` (`script`).
+
+Radios, checkboxes and switches carry `checked` in the element list, so you can
+confirm a click took without a screenshot. Custom controls (`material-radio`,
+`mat-radio-button`, `mat-checkbox`, `role="radio"`/`"checkbox"`/`"switch"`...) and
+visually-hidden native inputs are indexed; a hidden input is badged via its
+label. `click_via: "script"` means it has nothing visible to click, so a numbered
+click toggles it with `element.click()`.
+
+Raw `--x`/`--y` are **screenshot pixels** and are converted to page pixels for
+you when the screenshot was shrunk. Pass `--coord-space css` if you took them
+from the element list, which is in page pixels already. Prefer `--target`,
+`--text` or `--selector` over coordinates whenever you can.
+
 ---
 
-## Known limitation: cross-origin iframes, where typing fails silently
+## Cross-origin iframes
 
-The element walk cannot read `contentDocument` across an origin boundary, so a
-page whose content sits in a foreign iframe returns **only the outer page's
-chrome**. Known case: the Azure portal Conditional Access blade, which renders
-from `*.hosting.portal.azure.com` inside `portal.azure.com`. Shadow DOM is not
-pierced either.
+Some portals render their content inside an iframe from a different origin - the
+Azure portal hosts many blades on `*.hosting.portal.azure.net` inside
+`portal.azure.com`. From v1.5.0 these frames are scanned and driven: their
+elements appear in the list with a `frameId`, and click, form_input, type, key,
+select_option, scroll, wait_for and read_content all work inside them.
 
-The failure modes differ, which is the trap:
+Tested against a genuine cross-origin frame (separate site, separate process),
+including a hostile page trying to forge frame positions to redirect clicks.
+**Not yet tested on the real Azure portal.** The first time you use it on a blade
+that previously showed only page chrome - Conditional Access especially - re-read
+state after every fill and confirm the value is really there before reporting it
+done.
 
-| | Behaviour |
-| --- | --- |
-| Element scan | Returns nothing from the iframe. Obvious. |
-| `click` by x/y | Probably **works** - mouse events route by hit-test |
-| `type` / `key` | **Fails silently.** No error, nothing typed |
+Limits:
 
-Keystrokes are dispatched on the main-frame session, so when focus is inside the
-cross-origin iframe they go nowhere and the page never errors. Do not read "no
-error" as "it worked".
-
-If `get_state` returns only navigation and no page content: say so, try
-`read_content`, and never report a field as filled unless you have re-read state
-and can see the value. On these blades you cannot. Hand that step back to the
-user and name the blade.
+- **Open shadow roots are scanned** (`shadow: true`); **closed ones cannot be**,
+  by design of the browser. If a web component shows no inner controls, try
+  `click --text`.
+- An element with `coords_unknown: true` is in a frame whose position could not
+  be confirmed. form_input and select_option still work on it; click by number is
+  refused. Run get_state again.
+- Every response carries `element_scan`. If `world` is `main`, the all-frames scan
+  failed and only the top frame was indexed - frame content is missing from the
+  list, not absent from the page. `error` says why.
 
 ## Security
 

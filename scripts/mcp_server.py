@@ -141,8 +141,23 @@ def summarise(result: dict, include_elements=True) -> str:
         lines.append(f"dialog: {dlg.get('type')} {verb}{note}"
                      f"\n        \"{dlg.get('message', '')}\"")
 
+    act = result.get("action_result")
+    if act:
+        where = " inside a frame" if act.get("in_frame") else ""
+        how = "real mouse click" if act.get("method") == "mouse" else "element.click() by script"
+        lines.append(f"clicked: <{act.get('tag', '?')}> \"{act.get('clicked', '')}\"{where} ({how})")
+    if result.get("coords_converted"):
+        lines.append(f"x/y read as screenshot pixels and scaled x{result['coords_converted']} "
+                     f"to page pixels {result.get('coords_used')}")
+
     if result.get("screenshot_saved"):
-        lines.append(f"screenshot: {result['screenshot_saved']}")
+        size = result.get("screenshot_size")
+        scale = result.get("image_to_css")
+        extra = ""
+        if size and scale and abs(scale - 1) > 1e-3:
+            extra = (f"  ({size[0]}x{size[1]}, shrunk: 1 image px = {scale} page px; "
+                     f"x/y you pass are rescaled for you)")
+        lines.append(f"screenshot: {result['screenshot_saved']}{extra}")
     if result.get("brain_sync_path"):
         lines.append(f"brain_artifact: {result['brain_sync_path']}")
     if result.get("screenshot_mode") == "focused":
@@ -161,6 +176,14 @@ def summarise(result: dict, include_elements=True) -> str:
             else:
                 lines.append(f"  [console] {err.get('level')}: {err.get('text')}")
 
+    scan = result.get("element_scan") or {}
+    if scan.get("world") == "main":
+        lines.append(
+            "scan: only the top frame was indexed - content inside iframes is NOT in "
+            f"this list. Reason: {scan.get('error', 'unknown')}. Call browser_get_state "
+            "again before concluding something is missing."
+        )
+
     if include_elements:
         elements = result.get("elements", [])
         lines.append(f"\ninteractive elements ({len(elements)}):")
@@ -171,6 +194,19 @@ def summarise(result: dict, include_elements=True) -> str:
                 bits.append(f"({el['type']})")
             if text:
                 bits.append(f'"{text}"')
+            if "checked" in el:
+                bits.append({True: "[x]", False: "[ ]"}.get(el["checked"], "[-]"))
+            if el.get("selected") is True:
+                bits.append("{selected}")
+            if el.get("frameId"):
+                bits.append("{frame}")
+            if el.get("shadow"):
+                bits.append("{shadow}")
+            if el.get("click_via") == "script":
+                bits.append("{hidden control - clicked by script}")
+            if el.get("coords_unknown"):
+                # fill/select still work; click by number is refused
+                bits.append("{position unknown - fill only}")
             lines.append("  " + " ".join(bits))
         if len(elements) > 120:
             lines.append(f"  … {len(elements) - 120} more")
@@ -224,8 +260,47 @@ TOOLS = [
             "type": "object",
             "properties": {
                 "target": {"type": "integer", "description": "Element number from get_state."},
-                "x": {"type": "integer"},
-                "y": {"type": "integer"},
+                "assert_text": {
+                    "type": "string",
+                    "description": (
+                        "Abort unless the element's text, read live at the moment of the "
+                        "click, contains this substring. Also refuses if something covers "
+                        "the element's click point."
+                    ),
+                },
+                "within": {
+                    "type": "integer",
+                    "description": (
+                        "Abort unless the target is inside this container element (a modal "
+                        "or flyout). Also refuses if something covers the click point."
+                    ),
+                },
+                "text": {
+                    "type": "string",
+                    "description": (
+                        "Click the element whose visible text is this, searching every frame "
+                        "and open shadow root. Exact match preferred; if several elements "
+                        "match, nothing is clicked and the matches are listed."
+                    ),
+                },
+                "selector": {
+                    "type": "string",
+                    "description": (
+                        "Click the element matching this CSS selector, e.g. "
+                        "material-radio[value='yes']. Combine with text to narrow it. "
+                        "Refused if more than one visible element matches."
+                    ),
+                },
+                "x": {"type": "integer", "description": "Screenshot pixel x (see coord_space)."},
+                "y": {"type": "integer", "description": "Screenshot pixel y (see coord_space)."},
+                "coord_space": {
+                    "type": "string",
+                    "enum": ["image", "css"],
+                    "description": (
+                        "What x/y are measured in. 'image' (default): pixels of the last "
+                        "screenshot, rescaled to the page automatically. 'css': page pixels."
+                    ),
+                },
                 "tab_id": {"type": "integer"},
             },
         },
@@ -234,12 +309,14 @@ TOOLS = [
         "name": "browser_type",
         "description": (
             "Type text into whatever currently has focus, optionally pressing Enter. "
-            "To fill a specific field reliably, prefer browser_fill."
+            "Pass target to focus that element first, which also works inside "
+            "cross-origin frames. To fill a specific field reliably, prefer browser_fill."
         ),
         "inputSchema": {
             "type": "object",
             "properties": {
                 "text": {"type": "string"},
+                "target": {"type": "integer", "description": "Element number to focus before typing."},
                 "enter": {"type": "boolean", "description": "Press Enter afterwards."},
                 "tab_id": {"type": "integer"},
             },
@@ -258,6 +335,14 @@ TOOLS = [
             "properties": {
                 "target": {"type": "string", "description": "Element number or CSS selector."},
                 "text": {"type": "string"},
+                "enter": {"type": "boolean", "description": "Atomically press Enter immediately after setting text."},
+                "assert_text": {
+                    "type": "string",
+                    "description": (
+                        "Abort unless the element's text, read live at the moment of the "
+                        "action, contains this substring."
+                    ),
+                },
                 "tab_id": {"type": "integer"},
             },
             "required": ["target", "text"],
@@ -285,12 +370,22 @@ TOOLS = [
     },
     {
         "name": "browser_scroll",
-        "description": "Scroll the page up or down by a pixel amount.",
+        "description": (
+            "Scroll with a real mouse wheel at a point - the viewport centre by default - "
+            "so it moves whichever panel is under that point, including inside "
+            "cross-origin frames. Pass x/y to scroll a different panel, or target to "
+            "bring one element into view instead."
+        ),
         "inputSchema": {
             "type": "object",
             "properties": {
                 "direction": {"type": "string", "enum": ["up", "down"]},
                 "amount": {"type": "integer", "description": "Pixels, default 500."},
+                "x": {"type": "integer", "description": "Screenshot pixel x to scroll at."},
+                "y": {"type": "integer", "description": "Screenshot pixel y to scroll at."},
+                "coord_space": {"type": "string", "enum": ["image", "css"],
+                                "description": "What x/y are measured in; default image."},
+                "target": {"type": "integer", "description": "Element number to scroll into view."},
                 "tab_id": {"type": "integer"},
             },
         },
@@ -409,6 +504,19 @@ TOOLS = [
             },
         },
     },
+    {
+        "name": "browser_wait_for",
+        "description": "Wait for expected text to appear anywhere in the page (across all frames/blades) before proceeding. Default timeout 4000ms.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "text": {"type": "string", "description": "Text substring to wait for."},
+                "timeout": {"type": "integer", "description": "Timeout in ms (default 4000, max 10000)."},
+                "tab_id": {"type": "integer"},
+            },
+            "required": ["text"],
+        },
+    },
 ]
 
 # Any action that navigates or mutates the page can raise a dialog, so the same
@@ -453,6 +561,7 @@ ACTION_FOR = {
     "browser_select_option": "select_option",
     "browser_new_tab": "new_tab",
     "browser_close_tab": "close_tab",
+    "browser_wait_for": "wait_for",
 }
 
 
@@ -463,7 +572,8 @@ def dispatch_tool(name: str, args: dict) -> str:
 
     payload = {"action": action}
     for key in ("tab_id", "url", "text", "key", "modifiers", "code", "direction", "amount", "x", "y",
-                "value", "max_length", "visual_badges", "on_dialog", "dialog_text"):
+                "value", "max_length", "visual_badges", "on_dialog", "dialog_text",
+                "assert_text", "within", "timeout", "selector", "coord_space"):
         if key in args and args[key] is not None:
             payload[key] = args[key]
 

@@ -46,7 +46,7 @@ Then the **one** manual step:
 | --- | --- |
 | `browser_get_state` | URL, title, interactive elements with **visual numbered badges**, and screenshot |
 | `browser_navigate` | Go to any URL |
-| `browser_click` | Click by numbered badge (`1`, `2`, ...) or x/y coordinates |
+| `browser_click` | Click by numbered badge, visible text, CSS selector, or screenshot x/y |
 | `browser_type` | Type text into whatever element has focus |
 | `browser_fill` | Set an input field by badge ID or CSS selector (React-safe) |
 | `browser_key` | Send named keys (`Enter`, `Tab`, `ArrowDown`) with optional modifiers (`Control`, `Shift`, `Alt`, `Meta`) |
@@ -59,7 +59,23 @@ Then the **one** manual step:
 | `browser_new_tab` | Open a new tab in the active agent tab group |
 | `browser_close_tab` | Close the agent working tab |
 | `browser_focus_tab` | Bring the working tab to the foreground (for manual logins/captchas) |
+| `browser_ensure_tab` | Return the working tab, reusing it if still open |
+| `browser_wait_for` | Wait for text to appear in any frame (default 4s, max 10s) |
 | `browser_eval` | Run arbitrary JavaScript in page context (requires `-AllowEval`) |
+
+From v1.5.0, elements inside cross-origin iframes (for example Azure portal
+blades hosted on `*.hosting.portal.azure.net`) are scanned and driven.
+`browser_click` and `browser_fill` take `assert_text`, which re-reads the element
+live and refuses if it changed or is covered; `browser_click` also takes
+`within`. `browser_click` can also target by `text` or CSS `selector`, and
+refuses ambiguous matches. Custom radios and checkboxes (`material-radio`,
+`mat-radio-button`, hidden native inputs), open shadow roots and their checked
+state are all in the element list.
+
+```powershell
+python scripts/test_frames.py   [Kiro|AG] --spoof   # cross-origin frames + hostile page
+python scripts/test_controls.py [Kiro|AG]           # custom controls, click by text/selector
+```
 
 `browser_navigate`, `browser_click`, `browser_type`, `browser_fill` and
 `browser_key` also take `on_dialog` and `dialog_text`. See below.

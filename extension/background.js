@@ -1020,6 +1020,16 @@ const COLLECT_FRAME_ELEMENTS = (SEL) => {
     ).replace(/\s+/g, ' ').trim().slice(0, 80);
   };
 
+  // A grid's row checkboxes are all labelled "Select row", so on their own
+  // they cannot be told apart. Name them after the row they select.
+  const isToggle = (el) => isToggleInput(el) ||
+    /^(checkbox|radio|switch)$/i.test(el.getAttribute('role') || '') ||
+    /^(MATERIAL|MAT)-(CHECKBOX|RADIO)/.test(el.tagName);
+  const rowTextOf = (el) => {
+    const row = isToggle(el) && el.closest('[role="row"], tr');
+    return row ? (row.innerText || '').replace(/\s+/g, ' ').trim().slice(0, 120) : '';
+  };
+
   // Checked state, so an agent can confirm a radio or checkbox took the click
   // without a screenshot.
   const checkedOf = (el) => {
@@ -1100,10 +1110,12 @@ const COLLECT_FRAME_ELEMENTS = (SEL) => {
 
       const checked = checkedOf(el);
       const selected = el.getAttribute('aria-selected');
+      const ownText = labelOf(el);
+      const rowText = rowTextOf(el);
       entries.push({ el, cx, cy, item: {
         tag: el.tagName.toLowerCase(),
         type: el.getAttribute('type') || el.getAttribute('role') || '',
-        text: labelOf(el),
+        text: rowText && rowText !== ownText ? (ownText ? `${ownText}: ${rowText}` : rowText) : ownText,
         href: (el.getAttribute('href') || '').slice(0, 200),
         x: cx,
         y: cy,
@@ -1166,16 +1178,21 @@ const VERIFY_TARGET = (localId, expected, hitTest, containerLocalId) => {
   if (!el.isConnected) return { ok: false, error: 'element was removed from the page since get_state' };
 
   if (expected !== null && expected !== undefined) {
+    // A row checkbox is listed under its row's text, so assert against that too.
+    const isToggle = (el.tagName === 'INPUT' && /^(radio|checkbox)$/i.test(el.getAttribute('type') || '')) ||
+      /^(checkbox|radio|switch)$/i.test(el.getAttribute('role') || '') ||
+      /^(MATERIAL|MAT)-(CHECKBOX|RADIO)/.test(el.tagName);
+    const row = isToggle && el.closest('[role="row"], tr');
     const live = (
-      el.getAttribute('aria-label') || el.innerText || el.value ||
+      (el.getAttribute('aria-label') || el.innerText || el.value ||
       el.getAttribute('placeholder') || el.getAttribute('title') ||
-      el.getAttribute('name') || ''
+      el.getAttribute('name') || '') + (row ? ' ' + (row.innerText || '') : '')
     ).replace(/\s+/g, ' ').trim();
     const want = String(expected).trim().toLowerCase();
     if (!live.toLowerCase().includes(want)) {
       return {
         ok: false,
-        error: `assert_text failed: element now reads "${live.slice(0, 80)}", expected "${expected}"`
+        error: `assert_text failed: element now reads "${live.slice(0, 160)}", expected "${expected}"`
       };
     }
   }
@@ -1596,6 +1613,61 @@ async function annotate(tabId) {
     return fallbackItems;
   } catch (e) {
     return [];
+  }
+}
+
+/**
+ * Whether one frame shows some text, searched the way the element scanner sees
+ * the page: open shadow roots as well as the document, and the names controls
+ * are listed under (an icon button's aria-label, an input's value) as well as
+ * rendered text. body.innerText alone missed both, so wait_for timed out on
+ * text that get_state was listing.
+ *
+ * Self-contained so it can run via chrome.scripting or Runtime.evaluate.
+ */
+const PAGE_HAS_TEXT = (needle) => {
+  if (!document.documentElement) return false;
+  const norm = (s) => String(s || '').replace(/\s+/g, ' ').toLowerCase();
+  const roots = [document];
+  for (let i = 0; i < roots.length && roots.length < 500; i++) {
+    for (const n of roots[i].querySelectorAll('*')) if (n.shadowRoot) roots.push(n.shadowRoot);
+  }
+  for (const root of roots) {
+    // A shadow root has no innerText of its own; its children do.
+    const parts = root === document ? [document.body || document.documentElement]
+      : Array.from(root.children).filter((c) => !/^(STYLE|SCRIPT|TEMPLATE)$/.test(c.tagName));
+    for (const p of parts) if (norm(p.innerText).includes(needle)) return true;
+  }
+  for (const root of roots) {
+    for (const el of root.querySelectorAll('[aria-label], [title], [placeholder], input, textarea')) {
+      const names = [el.getAttribute('aria-label'), el.getAttribute('title'),
+        el.getAttribute('placeholder'), /^(INPUT|TEXTAREA)$/.test(el.tagName) ? el.value : ''];
+      if (names.some((n) => n && norm(n).includes(needle))) return true;
+    }
+  }
+  return false;
+};
+
+async function pageHasText(tabId, needle) {
+  const args = [needle];
+  const inject = (target) => withTimeout(
+    chrome.scripting.executeScript({ target, func: PAGE_HAS_TEXT, args }), 2500, 'wait_for executeScript');
+  try {
+    const res = await inject({ tabId, allFrames: true });
+    return res.some((r) => r && r.result);
+  } catch (e) { /* one unscriptable frame fails the lot - try them one by one */ }
+
+  let frames = [];
+  try { frames = (await chrome.webNavigation.getAllFrames({ tabId })) || []; } catch (e) { /* none */ }
+  const res = await Promise.allSettled(frames.map((f) => inject({ tabId, frameIds: [f.frameId] })));
+  if (res.some((r) => r.status === 'fulfilled' && r.value && r.value[0] && r.value[0].result)) return true;
+  if (res.some((r) => r.status === 'fulfilled')) return false;
+
+  // No script access at all (e.g. file:// without the setting): top frame only.
+  try {
+    return !!(await evaluate(tabId, `(${PAGE_HAS_TEXT.toString()})(...${JSON.stringify(args)})`));
+  } catch (e) {
+    return false;
   }
 }
 
@@ -2285,26 +2357,16 @@ async function handleCommand(cmd) {
 
       case 'wait_for': {
         if (!cmd.text) throw new Error('wait_for requires --text parameter');
-        const needle = String(cmd.text).trim().toLowerCase();
+        const needle = String(cmd.text).replace(/\s+/g, ' ').trim().toLowerCase();
         const timeoutMs = Math.min(Math.max(parseInt(cmd.timeout || 4000, 10), 500), 10000);
         const startTime = Date.now();
         let found = false;
 
         while (Date.now() - startTime < timeoutMs) {
-          try {
-            const results = await chrome.scripting.executeScript({
-              target: { tabId, allFrames: true },
-              func: (textToFind) => {
-                if (!document || !document.body) return false;
-                return document.body.innerText.toLowerCase().includes(textToFind);
-              },
-              args: [needle]
-            });
-            if (results && results.some((r) => r && r.result)) {
-              found = true;
-              break;
-            }
-          } catch (e) { /* non-fatal, retry until timeout */ }
+          if (await pageHasText(tabId, needle)) {
+            found = true;
+            break;
+          }
           await new Promise((r) => setTimeout(r, 200));
         }
 

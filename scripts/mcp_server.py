@@ -115,8 +115,15 @@ def call_bridge(payload: dict) -> dict:
                          f"'python scripts/bridge_server.py --server' first ({exc.reason})"}
 
 
-def summarise(result: dict, include_elements=True) -> str:
-    """Turn a bridge response into compact text for the model."""
+ELEMENT_PAGE = 120
+
+
+def summarise(result: dict, include_elements=True, offset=0, match=None) -> str:
+    """Turn a bridge response into compact text for the model.
+
+    offset and match only page and filter what is printed. Element numbers come
+    from the extension and are the same whichever slice is shown.
+    """
     if result.get("status") != "ok":
         return f"ERROR: {result.get('error', 'unknown error')}"
 
@@ -186,8 +193,22 @@ def summarise(result: dict, include_elements=True) -> str:
 
     if include_elements:
         elements = result.get("elements", [])
-        lines.append(f"\ninteractive elements ({len(elements)}):")
-        for el in elements[:120]:
+        shown = elements
+        header = f"{len(elements)}"
+        if match:
+            needle = " ".join(str(match).split()).lower()
+            shown = [el for el in elements
+                     if needle in " ".join(str(el.get("text", "")).split()).lower()]
+            header += f", {len(shown)} matching {str(match)!r}"
+        try:
+            offset = max(0, int(offset or 0))
+        except (TypeError, ValueError):
+            offset = 0
+        page = shown[offset:offset + ELEMENT_PAGE]
+        lines.append(f"\ninteractive elements ({header}):")
+        if offset:
+            lines.append(f"  … {min(offset, len(shown))} skipped (offset={offset})")
+        for el in page:
             text = el.get("text", "")
             bits = [f"[{el['id']}]", el.get("tag", "")]
             if el.get("type"):
@@ -208,8 +229,10 @@ def summarise(result: dict, include_elements=True) -> str:
                 # fill/select still work; click by number is refused
                 bits.append("{position unknown - fill only}")
             lines.append("  " + " ".join(bits))
-        if len(elements) > 120:
-            lines.append(f"  … {len(elements) - 120} more")
+        rest = len(shown) - offset - len(page)
+        if rest > 0:
+            lines.append(f"  … {rest} more - pass offset={offset + len(page)} to see them, "
+                         f"or match to filter by text")
 
     tabs = result.get("tabs", [])
     if len(tabs) > 1:
@@ -233,7 +256,15 @@ TOOLS = [
             "type": "object",
             "properties": {
                 "tab_id": {"type": "integer", "description": "Target a specific tab id."},
-                "visual_badges": {"type": "boolean", "description": "Whether to overlay high-contrast visual badge stickers on the screenshot (default true)."}
+                "visual_badges": {"type": "boolean", "description": "Whether to overlay high-contrast visual badge stickers on the screenshot (default true)."},
+                "offset": {"type": "integer", "description": (
+                    "Skip this many elements of the list before printing (120 are printed at "
+                    "a time). Use the offset the '… N more' line gives. Element numbers do "
+                    "not change with offset.")},
+                "match": {"type": "string", "description": (
+                    "Only list elements whose text contains this (case-insensitive). Row "
+                    "checkboxes carry their row's text, so a server or resource name finds "
+                    "its checkbox. Element numbers do not change with match.")},
             },
         },
     },
@@ -618,7 +649,8 @@ def dispatch_tool(name: str, args: dict) -> str:
         lines.append("\n* = tab the user is looking at, [agent] = the active agent tab you drive")
         return "\n".join(lines)
 
-    return summarise(result, include_elements=(name != "browser_eval"))
+    return summarise(result, include_elements=(name != "browser_eval"),
+                     offset=args.get("offset"), match=args.get("match"))
 
 
 # ---------------------------------------------------------------------------

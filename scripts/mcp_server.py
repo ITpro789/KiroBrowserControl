@@ -425,7 +425,7 @@ TOOLS = [
         "name": "browser_list_tabs",
         "description": (
             "List all open tabs with their ids, titles and URLs. The tab marked [agent] "
-            "is the one in the Kiro tab group that browser tools drive by default."
+            f"is the one in the {CLIENT_NAME} tab group that browser tools drive by default."
         ),
         "inputSchema": {"type": "object", "properties": {}},
     },
@@ -434,7 +434,7 @@ TOOLS = [
         "description": (
             "Adopt an existing tab as the agent's working tab, so later calls without "
             "tab_id act on it. Use when the user asks you to work on a page they already "
-            "have open instead of the Kiro tab."
+            f"have open instead of the {CLIENT_NAME} tab."
         ),
         "inputSchema": {
             "type": "object",

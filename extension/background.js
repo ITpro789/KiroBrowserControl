@@ -305,13 +305,16 @@ const INTERNAL_PREFIXES = ['chrome://', 'edge://', 'about:', 'chrome-extension:/
 // each other's page, and each then reads a screenshot of the other's work.
 // Relabelling a single shared group is cosmetic, not isolation.
 const AGENT_STYLES = {
-  Kiro: { title: 'Kiro', color: 'cyan' },
-  AG:   { title: 'AG',   color: 'blue' }
+  Kiro:   { title: 'Kiro',   color: 'cyan' },
+  AG:     { title: 'AG',     color: 'blue' },
+  Claude: { title: 'Claude', color: 'orange' }
 };
 const DEFAULT_AGENT = 'Kiro';
 
 function normaliseAgent(agentName) {
-  if (/^(ag|antigravity)$/i.test(String(agentName || '').trim())) return 'AG';
+  const n = String(agentName || '').trim();
+  if (/^(ag|antigravity)$/i.test(n)) return 'AG';
+  if (/^claude([ -]code)?$/i.test(n)) return 'Claude';
   return DEFAULT_AGENT;
 }
 
@@ -764,7 +767,7 @@ async function clickAt(tabId, x, y) {
   const base = { x: Math.round(x), y: Math.round(y), button: 'left', clickCount: 1 };
   await sendCDP(tabId, 'Input.dispatchMouseEvent', { type: 'mouseMoved', ...base, clickCount: 0 });
   await sendCDP(tabId, 'Input.dispatchMouseEvent', { type: 'mousePressed', ...base });
-  await new Promise((r) => setTimeout(r, 60));
+  await new Promise((r) => setTimeout(r, 20));
   await sendCDP(tabId, 'Input.dispatchMouseEvent', { type: 'mouseReleased', ...base });
 }
 
@@ -927,11 +930,14 @@ function makeNonce() {
 async function cascadeFramePositions(tabId) {
   const nonce = makeNonce();
   try {
-    await chrome.scripting.executeScript({
+    const prepRes = await chrome.scripting.executeScript({
       target: { tabId, allFrames: true },
       func: PREPARE_FRAME,
       args: [nonce]
     });
+    // Fast-path: if there is only the top frame, its offset is already {x:0, y:0}
+    if (!prepRes || prepRes.length <= 1) return;
+
     await chrome.scripting.executeScript({
       target: { tabId, frameIds: [0] },
       func: POST_TOP_OFFSETS,
@@ -941,7 +947,7 @@ async function cascadeFramePositions(tabId) {
     // Offsets arrive asynchronously and cascade one level at a time, so wait
     // until every frame has one rather than guessing with a fixed pause.
     for (let i = 0; i < 8; i++) {
-      await new Promise((r) => setTimeout(r, 40));
+      await new Promise((r) => setTimeout(r, 15));
       const res = await chrome.scripting.executeScript({
         target: { tabId, allFrames: true },
         func: () => !!window.__kiro_frame_offset
@@ -967,6 +973,7 @@ const INTERACTIVE_SEL = 'a, button, input, select, textarea, summary, label, ' +
   '[role="checkbox"], [role="radio"], [role="switch"], ' +
   'material-radio, material-checkbox, material-toggle, ' +
   'mat-radio-button, mat-checkbox, mat-slide-toggle, ' +
+  '.cursor-hover, [onclick], ' +
   '[contenteditable="true"], [tabindex]:not([tabindex="-1"])';
 
 const COLLECT_FRAME_ELEMENTS = (SEL) => {
@@ -1010,6 +1017,7 @@ const COLLECT_FRAME_ELEMENTS = (SEL) => {
       ? Array.from(el.labels).map((l) => l.innerText).join(' ') : '';
     return (
       el.getAttribute('aria-label') ||
+      el.getAttribute('data-acc-text') ||
       (labelled ? byIds(elRoot, labelled) : '') ||
       fromLabels ||
       el.innerText ||
@@ -1277,7 +1285,7 @@ const FIND_CLICK_TARGETS = (SEL, selector, text) => {
     }).join(' ') : '';
     const fromLabels = isToggleInput(el) && el.labels && el.labels.length
       ? Array.from(el.labels).map((l) => l.innerText).join(' ') : '';
-    return (el.getAttribute('aria-label') || byIds || fromLabels || el.innerText ||
+    return (el.getAttribute('aria-label') || el.getAttribute('data-acc-text') || byIds || fromLabels || el.innerText ||
       el.value || el.getAttribute('placeholder') || el.getAttribute('title') || '')
       .replace(/\s+/g, ' ').trim();
   };
@@ -2137,7 +2145,10 @@ async function handleCommand(cmd) {
         } else {
           throw new Error('click requires target, selector, text, or x/y');
         }
-        await new Promise((r) => setTimeout(r, 600));
+        {
+          const waitMs = cmd.wait_ms !== undefined ? Number(cmd.wait_ms) : (cmd.no_state ? 60 : 180);
+          if (waitMs > 0) await new Promise((r) => setTimeout(r, waitMs));
+        }
         break;
       }
 
@@ -2159,7 +2170,7 @@ async function handleCommand(cmd) {
         if (cmd.enter) {
           await sendKey(tabId, 'Enter');
         }
-        await new Promise((r2) => setTimeout(r2, 250));
+        await new Promise((r2) => setTimeout(r2, cmd.wait_ms !== undefined ? Number(cmd.wait_ms) : 80));
         break;
       }
 
@@ -2184,20 +2195,20 @@ async function handleCommand(cmd) {
           }
         }
         await typeText(tabId, cmd.text || '', !!cmd.enter);
-        await new Promise((r) => setTimeout(r, 500));
+        await new Promise((r) => setTimeout(r, cmd.wait_ms !== undefined ? Number(cmd.wait_ms) : 100));
         break;
       }
 
       case 'key':
         await sendKey(tabId, cmd.key || 'Enter', cmd.modifiers || []);
-        await new Promise((r) => setTimeout(r, 350));
+        await new Promise((r) => setTimeout(r, cmd.wait_ms !== undefined ? Number(cmd.wait_ms) : 100));
         break;
 
       case 'select_option': {
         if (!cmd.target) throw new Error('select_option requires target');
         const r = await selectOption(tabId, cmd.target, cmd.value || cmd.text || '');
         if (r && r.error) throw new Error(r.error);
-        await new Promise((r2) => setTimeout(r2, 400));
+        await new Promise((r2) => setTimeout(r2, cmd.wait_ms !== undefined ? Number(cmd.wait_ms) : 120));
         break;
       }
 
@@ -2384,36 +2395,50 @@ async function handleCommand(cmd) {
         throw new Error(`unknown action: ${action}`);
     }
 
-    const current = await chrome.tabs.get(tabId);
-    const elements = await annotate(tabId);
+    if (cmd.no_state) {
+      const current = await chrome.tabs.get(tabId);
+      return {
+        status: 'ok',
+        tab: {
+          id: current.id,
+          title: current.title,
+          url: current.url,
+          agent: agentOwning(current.id) !== null,
+          agent_name: agentOwning(current.id) || activeAgent,
+          active: current.active,
+          source: tabSource
+        },
+        ...(actionInfo ? { action_result: actionInfo } : {}),
+        ...(dialogLog.get(tabId)?.length ? { dialogs: dialogLog.get(tabId) } : {})
+      };
+    }
 
-    // Element coordinates come from getBoundingClientRect, which is CSS pixels,
-    // but Page.captureScreenshot returns device pixels. On a scaled display the
-    // two differ, so the viewport is reported and the bridge rescales to match.
-    let viewport = null;
-    try {
-      viewport = await evaluate(
+    // Run tab query, DOM scan, viewport query, screenshot capture, and tab listing in parallel
+    const [current, elements, viewport, shotResult, allTabs] = await Promise.all([
+      chrome.tabs.get(tabId),
+      annotate(tabId),
+      cmd.skip_screenshot ? Promise.resolve(null) : evaluate(
         tabId,
         '({ width: window.innerWidth, height: window.innerHeight, dpr: window.devicePixelRatio })'
-      );
-    } catch (e) { /* non-fatal, bridge falls back to a plain size cap */ }
+      ).catch(() => null),
+      cmd.skip_screenshot ? Promise.resolve({ ok: false, error: null }) : captureScreenshot(tabId).then(
+        (shot) => ({ ok: true, shot }),
+        (e) => ({ ok: false, error: String((e && e.message) || e) })
+      ),
+      cmd.skip_screenshot ? Promise.resolve([]) : getAllTabs()
+    ]);
 
-    // The element list is useful on its own, so a capture failure degrades the
-    // response rather than failing the whole command.
     let screenshot = '';
     let screenshotError = null;
     let screenshotMode = null;
     let backgroundCaptureError = null;
-    try {
-      const shot = await captureScreenshot(tabId);
-      screenshot = shot.data;
-      screenshotMode = shot.mode;
-      backgroundCaptureError = shot.backgroundError || null;
-    } catch (e) {
-      screenshotError = String((e && e.message) || e);
+    if (shotResult.ok) {
+      screenshot = shotResult.shot.data;
+      screenshotMode = shotResult.shot.mode;
+      backgroundCaptureError = shotResult.shot.backgroundError || null;
+    } else {
+      screenshotError = shotResult.error;
     }
-
-
 
     return {
       status: 'ok',
@@ -2426,7 +2451,7 @@ async function handleCommand(cmd) {
         active: current.active,
         source: tabSource
       },
-      tabs: await getAllTabs(),
+      tabs: allTabs,
       interactive_elements_count: elements.length,
       elements,
       ...(actionInfo ? { action_result: actionInfo } : {}),

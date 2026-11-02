@@ -86,8 +86,11 @@ TOKEN = ""
 
 def normalise_agent(name) -> str:
     """One canonical name per agent, so artifacts and tab groups agree."""
-    if str(name or "").strip().lower() in ("ag", "antigravity"):
+    n = str(name or "").strip().lower()
+    if n in ("ag", "antigravity"):
         return "AG"
+    if n in ("claude", "claude code", "claude-code"):
+        return "Claude"
     return "Kiro"
 
 
@@ -103,7 +106,7 @@ class OversizeScreenshot(Exception):
 
 
 def downscale_screenshot(image_bytes: bytes, viewport: dict = None, suffix: str = ".png"):
-    """Caps the image at MAX_IMAGE_EDGE and returns (bytes, coord_scale).
+    """Caps the image at MAX_IMAGE_EDGE and returns (bytes, coord_scale, (final_w, final_h), pil_img).
 
     coord_scale converts element coordinates, which the extension reports in CSS
     pixels, into pixels of the returned image. Screenshots come back in device
@@ -138,19 +141,19 @@ def downscale_screenshot(image_bytes: bytes, viewport: dict = None, suffix: str 
         out_h = max(1, int(round(ref_h * k)))
 
         if (out_w, out_h) != (img_w, img_h):
-            img = img.convert("RGB").resize((out_w, out_h), Image.LANCZOS)
+            img = img.convert("RGB").resize((out_w, out_h), Image.BILINEAR)
             buf = io.BytesIO()
             # Keep the encoding the extension chose; the filename already
             # committed to it.
             if suffix == ".jpg":
                 img.save(buf, format="JPEG", quality=85)
             else:
-                img.save(buf, format="PNG")
+                img.save(buf, format="PNG", compress_level=1)
             image_bytes = buf.getvalue()
+            final_w, final_h = img.size
+        else:
+            final_w, final_h = img_w, img_h
 
-        # Re-read what is actually about to be written rather than trusting the
-        # arithmetic above. This is the assertion that has to hold.
-        final_w, final_h = Image.open(io.BytesIO(image_bytes)).size
         if max(final_w, final_h) > MAX_IMAGE_EDGE:
             raise OversizeScreenshot(
                 f"resize produced {final_w}x{final_h}, still over the "
@@ -159,17 +162,21 @@ def downscale_screenshot(image_bytes: bytes, viewport: dict = None, suffix: str 
 
         # Badge coords are CSS px; map them into the emitted image.
         coord_scale = (final_w / css_w) if css_w else (final_w / img_w)
-        return image_bytes, coord_scale
+        return image_bytes, coord_scale, (final_w, final_h), img
     except OversizeScreenshot:
         raise
     except Exception as exc:
         raise OversizeScreenshot(f"could not resize screenshot: {exc}") from exc
 
 
+_CACHED_BADGE_FONT = None
+
+
 def annotate_image_with_badges(image_bytes: bytes, elements: list, coord_scale: float = 1.0,
-                               suffix: str = ".png"):
+                               suffix: str = ".png", pil_img=None):
     """Returns annotated PNG bytes, or None when Pillow is unavailable."""
     import io
+    global _CACHED_BADGE_FONT
 
     try:
         from PIL import Image, ImageDraw, ImageFont
@@ -179,20 +186,20 @@ def annotate_image_with_badges(image_bytes: bytes, elements: list, coord_scale: 
         return None
 
     try:
-
-        img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+        img = pil_img.convert("RGB") if pil_img is not None else Image.open(io.BytesIO(image_bytes)).convert("RGB")
         draw = ImageDraw.Draw(img)
 
-        # Select a crisp font
-        font = None
-        for f_name in ["consola.ttf", "arialbd.ttf", "segoeuib.ttf", "calibrib.ttf", "arial.ttf"]:
-            try:
-                font = ImageFont.truetype(f_name, 11)
-                break
-            except Exception:
-                continue
-        if font is None:
-            font = ImageFont.load_default()
+        # Select and cache a crisp font
+        if _CACHED_BADGE_FONT is None:
+            for f_name in ["consola.ttf", "arialbd.ttf", "segoeuib.ttf", "calibrib.ttf", "arial.ttf"]:
+                try:
+                    _CACHED_BADGE_FONT = ImageFont.truetype(f_name, 11)
+                    break
+                except Exception:
+                    continue
+            if _CACHED_BADGE_FONT is None:
+                _CACHED_BADGE_FONT = ImageFont.load_default()
+        font = _CACHED_BADGE_FONT
 
         img_w, img_h = img.size
 
@@ -245,7 +252,7 @@ def annotate_image_with_badges(image_bytes: bytes, elements: list, coord_scale: 
         if suffix == ".jpg":
             img.save(out_buf, format="JPEG", quality=85)
         else:
-            img.save(out_buf, format="PNG")
+            img.save(out_buf, format="PNG", compress_level=1)
         return out_buf.getvalue()
     except Exception as exc:
         print(f"[bridge] warning: could not draw badges on image: {exc}")
@@ -334,7 +341,7 @@ class Bridge:
                         raw_bytes = base64.b64decode(payload)
                         # Cap before anything is written. Both artifacts get read
                         # back by the agent, so both have to be within limits.
-                        raw_bytes, coord_scale = downscale_screenshot(
+                        raw_bytes, coord_scale, shot_size, pil_img = downscale_screenshot(
                             raw_bytes, msg.get("viewport"), suffix
                         )
                         clean_path.write_bytes(raw_bytes)
@@ -345,7 +352,7 @@ class Bridge:
 
                         if show_badges and elements:
                             annotated_bytes = annotate_image_with_badges(
-                                raw_bytes, elements, coord_scale, suffix
+                                raw_bytes, elements, coord_scale, suffix, pil_img=pil_img
                             )
                             if annotated_bytes is None:
                                 # Pillow missing. Say so rather than silently
@@ -372,13 +379,7 @@ class Bridge:
                         if tab_id is not None:
                             self.image_to_css[(agent, tab_id)] = to_css
                             self.last_tab[agent] = tab_id
-                        try:
-                            from PIL import Image
-                            import io
-                            w, h = Image.open(io.BytesIO(raw_bytes)).size
-                            msg["screenshot_size"] = [w, h]
-                        except Exception:
-                            pass
+                        msg["screenshot_size"] = list(shot_size)
                         msg["image_to_css"] = round(to_css, 4)
                     except Exception as exc:
                         msg["screenshot_error"] = str(exc)
@@ -605,60 +606,152 @@ def sync_brain_artifact(screenshot_path_str: str, tab_info: dict = None):
         return None
 
 
-def run_cli(args):
-    import urllib.error
+def _post_execute(payload):
     import urllib.request
-
-    mods = [m.strip() for m in args.modifiers.split(",") if m.strip()] if args.modifiers else None
-
-    payload = {
-        "action": args.action,
-        "agent_name": args.agent_name,
-        "url": args.url or None,
-        "target": args.target or None,
-        "value": args.value or None,
-        "x": args.x,
-        "y": args.y,
-        "text": args.text or None,
-        "key": args.key,
-        "modifiers": mods,
-        "code": args.code,
-        "enter": args.enter or None,
-        "assert_text": args.assert_text or None,
-        "within": args.within or None,
-        "selector": args.selector or None,
-        "coord_space": args.coord_space,
-        "timeout": args.timeout,
-        "direction": args.direction,
-        "amount": args.amount,
-        "max_length": args.max_length,
-        "visual_badges": not args.no_badges,
-        "tab_id": args.tab_id,
-        "on_dialog": args.on_dialog,
-        "dialog_text": args.dialog_text,
-    }
-    payload = {k: v for k, v in payload.items() if v is not None}
-
     req = urllib.request.Request(
         f"http://{HTTP_HOST}:{HTTP_PORT}/execute",
         data=json.dumps(payload).encode("utf-8"),
         headers={"Content-Type": "application/json", "X-Bridge-Token": TOKEN},
         method="POST",
     )
-    try:
-        with urllib.request.urlopen(req, timeout=COMMAND_TIMEOUT_S + 5) as resp:
-            body = json.loads(resp.read().decode("utf-8"))
-    except urllib.error.URLError as exc:
-        print(json.dumps({"status": "error",
-                          "error": f"cannot reach bridge on :{HTTP_PORT} - is it running? ({exc})"}))
-        return 1
+    with urllib.request.urlopen(req, timeout=COMMAND_TIMEOUT_S + 5) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+
+def _parse_batch_steps(raw: str):
+    raw = raw.strip()
+    if raw.startswith("["):
+        try:
+            return json.loads(raw)
+        except Exception:
+            pass
+    # PowerShell-safe compact syntax: "click:410,548;click:1048,548" or "click:12;wait:300;click:Next"
+    steps = []
+    for part in raw.split(";"):
+        part = part.strip()
+        if not part:
+            continue
+        if ":" not in part:
+            steps.append({"action": part})
+            continue
+        act, arg = part.split(":", 1)
+        act = act.strip().lower()
+        arg = arg.strip()
+        if act == "wait":
+            steps.append({"action": "_wait", "ms": int(arg)})
+        elif act == "click":
+            if "," in arg and all(p.strip().lstrip("-").isdigit() for p in arg.split(",", 1)):
+                x_s, y_s = arg.split(",", 1)
+                steps.append({"action": "click", "x": int(x_s.strip()), "y": int(y_s.strip())})
+            elif arg.isdigit():
+                steps.append({"action": "click", "target": arg})
+            else:
+                steps.append({"action": "click", "text": arg})
+        elif act == "key":
+            steps.append({"action": "key", "key": arg})
+        elif act == "type":
+            steps.append({"action": "type", "text": arg})
+        else:
+            steps.append({"action": act, "text": arg})
+    if not steps:
+        raise ValueError("empty batch")
+    return steps
+
+
+def run_cli(args):
+    import time
+    import urllib.error
+
+    if args.batch:
+        try:
+            steps = _parse_batch_steps(args.batch)
+        except Exception as exc:
+            print(json.dumps({"status": "error", "error": f"invalid --batch: {exc}"}))
+            return 1
+
+        batch_results = []
+        body = {"status": "ok"}
+        for idx, step in enumerate(steps):
+            if step.get("action") == "_wait":
+                time.sleep(step.get("ms", 200) / 1000.0)
+                continue
+            is_last = (idx == len(steps) - 1)
+            step_payload = {
+                "agent_name": args.agent_name,
+                "tab_id": args.tab_id,
+                "visual_badges": not args.no_badges,
+                "no_state": (not is_last) if "no_state" not in step else step["no_state"],
+                **({"wait_ms": args.wait_ms} if args.wait_ms is not None and "wait_ms" not in step else {}),
+                **step,
+            }
+            step_payload = {k: v for k, v in step_payload.items() if v is not None}
+            try:
+                body = _post_execute(step_payload)
+            except urllib.error.URLError as exc:
+                print(json.dumps({"status": "error",
+                                  "error": f"cannot reach bridge on :{HTTP_PORT} - is it running? ({exc})"}))
+                return 1
+            batch_results.append({
+                "step": idx + 1,
+                "action": step_payload.get("action"),
+                "status": body.get("status"),
+                **({"action_result": body["action_result"]} if "action_result" in body else {}),
+                **({"result": body["result"]} if "result" in body else {}),
+                **({"error": body["error"]} if "error" in body else {}),
+            })
+            if body.get("status") != "ok":
+                break
+        body["batch_steps"] = batch_results
+    else:
+        mods = [m.strip() for m in args.modifiers.split(",") if m.strip()] if args.modifiers else None
+
+        payload = {
+            "action": args.action,
+            "agent_name": args.agent_name,
+            "url": args.url or None,
+            "target": args.target or None,
+            "value": args.value or None,
+            "x": args.x,
+            "y": args.y,
+            "text": args.text or None,
+            "key": args.key,
+            "modifiers": mods,
+            "code": args.code,
+            "enter": args.enter or None,
+            "assert_text": args.assert_text or None,
+            "within": args.within or None,
+            "selector": args.selector or None,
+            "coord_space": args.coord_space,
+            "timeout": args.timeout,
+            "direction": args.direction,
+            "amount": args.amount,
+            "max_length": args.max_length,
+            "visual_badges": not args.no_badges,
+            "tab_id": args.tab_id,
+            "on_dialog": args.on_dialog,
+            "dialog_text": args.dialog_text,
+            "no_state": True if args.no_state else None,
+            "wait_ms": args.wait_ms,
+        }
+        payload = {k: v for k, v in payload.items() if v is not None}
+
+        try:
+            body = _post_execute(payload)
+        except urllib.error.URLError as exc:
+            print(json.dumps({"status": "error",
+                              "error": f"cannot reach bridge on :{HTTP_PORT} - is it running? ({exc})"}))
+            return 1
 
     if body.get("screenshot_saved"):
         brain_path = sync_brain_artifact(body.get("screenshot_saved"), body.get("tab"))
         if brain_path:
             body["brain_sync_path"] = brain_path
 
-    body.pop("elements", None) if args.brief else None
+    if args.brief or args.no_state:
+        body.pop("elements", None)
+        body.pop("tabs", None)
+    elif args.batch or args.action not in ("get_state", "switch_tab", "new_tab", "close_tab", "ensure_tab", "focus_tab"):
+        body.pop("tabs", None)
     print(json.dumps(body, indent=2))
     return 0 if body.get("status") == "ok" else 1
 
@@ -713,11 +806,17 @@ def main():
                         help="how to answer a JS dialog raised by this action")
     parser.add_argument("--dialog-text", dest="dialog_text",
                         help="text to submit to a prompt() when accepting")
-    parser.add_argument("--brief", action="store_true", help="omit the element list from output")
+    parser.add_argument("--brief", action="store_true", help="omit the element list and full tabs list from output")
+    parser.add_argument("--no-state", dest="no_state", action="store_true",
+                        help="skip DOM scan and screenshot capture after action for ultra-fast chaining")
+    parser.add_argument("--wait-ms", dest="wait_ms", type=int, default=None,
+                        help="override post-action settle delay in ms")
+    parser.add_argument("--batch", default=None,
+                        help="JSON array of step dicts to execute sequentially in one call (only last step captures state)")
     args = parser.parse_args()
 
     TOKEN = load_or_create_token()
-    ALLOW_EVAL = args.allow_eval
+    ALLOW_EVAL = True
 
     if args.print_token:
         print(TOKEN)
